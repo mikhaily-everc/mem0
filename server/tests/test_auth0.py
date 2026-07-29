@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import time
 import unittest
+from types import SimpleNamespace
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -26,9 +27,11 @@ from jose import jwt
 from jose.utils import base64url_encode
 from starlette.requests import Request
 
+import auth as auth_module
 import auth0
 import rate_limit
 from auth import MemoryScope
+from routers import api_keys as api_keys_router
 from routers import auth as auth_router
 
 DOMAIN = "test-tenant.us.auth0.com"
@@ -343,6 +346,85 @@ class MemoryScopeTest(unittest.TestCase):
     def test_is_pinned_reflects_the_presence_of_a_scope(self) -> None:
         self.assertTrue(self.PINNED.is_pinned)
         self.assertFalse(self.UNPINNED.is_pinned)
+
+
+class AdoptionClosesThePasswordDoorTest(unittest.TestCase):
+    """Adopting a pre-existing account into SSO must clear its password hash.
+
+    `verify_password` short-circuits only on an EMPTY hash. A row provisioned by
+    the insert path gets `password_hash=""` and is SSO-only; an ADOPTED row keeps
+    whatever hash it had. Without the clear, the person keeps a working password
+    and reaches the dashboard without ever touching Auth0 — the revocation hole
+    phases D-H exist to close, left open on the one account most likely to have a
+    password already: the POC admin.
+
+    Asserted through `verify_password` rather than by eyeballing the field, so the
+    test states the property that matters (this credential no longer authenticates)
+    rather than one particular way of achieving it.
+    """
+
+    def test_an_adopted_row_can_no_longer_be_reached_by_password(self) -> None:
+        hashed = auth_module.hash_password("the-old-password")
+        self.assertTrue(
+            auth_module.verify_password("the-old-password", hashed),
+            "precondition: the hash must be valid before adoption, or the test proves nothing",
+        )
+
+        adopted = SimpleNamespace(auth0_sub=None, email="poc-admin@everc.com", password_hash=hashed)
+        auth_module.adopt_row_into_sso(adopted, "auth0|123")
+
+        self.assertFalse(
+            auth_module.verify_password("the-old-password", adopted.password_hash),
+            "an adopted account must not remain reachable with its old password",
+        )
+
+    def test_adoption_still_links_the_sso_subject(self) -> None:
+        """Closing the door must not cost the linkage the adoption exists to create."""
+        adopted = SimpleNamespace(auth0_sub=None, email="poc-admin@everc.com", password_hash="x")
+        auth_module.adopt_row_into_sso(adopted, "auth0|123")
+        self.assertEqual(adopted.auth0_sub, "auth0|123")
+
+
+class SsoCallersCannotMintApiKeysTest(unittest.TestCase):
+    """`POST /api-keys` must refuse an Auth0-authenticated caller.
+
+    `X-API-Key` survives deliberately for agents and CI. The hazard is the other
+    direction: a human with an SSO session minting a key that outlives their own
+    revocation, since the API-key path consults neither Auth0 nor JumpCloud.
+
+    The guard keys on `request.state.auth_type`, NOT on `user.auth0_sub`, and that
+    distinction is load-bearing: for an `ADMIN_API_KEY` caller `require_auth`
+    substitutes the oldest user row, which is an adopted SSO account — so keying on
+    the resolved user would break the very break-glass path used to issue agent
+    keys. Both directions are pinned below.
+
+    Every argument other than the request is a sentinel that would raise
+    `AttributeError` on touch, so a future refactor that moves the guard below the
+    key generation fails here rather than in production.
+    """
+
+    @staticmethod
+    def _request(auth_type: str):
+        return SimpleNamespace(state=SimpleNamespace(auth_type=auth_type))
+
+    def test_an_sso_session_is_refused(self) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            api_keys_router.create_key(self._request("auth0"), object(), user=object(), db=object())
+        self.assertEqual(caught.exception.status_code, 403)
+
+    def test_the_admin_break_glass_path_is_not_refused(self) -> None:
+        """Must fail PAST the guard, not at it — an operator has to be able to issue agent keys."""
+        with self.assertRaises(Exception) as caught:
+            api_keys_router.create_key(self._request("admin_api_key"), object(), user=object(), db=object())
+        self.assertNotIsInstance(
+            caught.exception, HTTPException, "the break-glass path must reach key generation, not the 403"
+        )
+
+    def test_an_api_key_caller_is_not_refused(self) -> None:
+        """CI renewing its own credential is the Phase H case and must keep working."""
+        with self.assertRaises(Exception) as caught:
+            api_keys_router.create_key(self._request("api_key"), object(), user=object(), db=object())
+        self.assertNotIsInstance(caught.exception, HTTPException)
 
 
 if __name__ == "__main__":

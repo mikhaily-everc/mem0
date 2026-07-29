@@ -151,6 +151,30 @@ def _resolve_user_from_api_key(key: str, db: Session) -> User:
     raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
+def adopt_row_into_sso(existing: User, sub: str) -> None:
+    """Link a pre-existing account to an Auth0 subject AND close its password door.
+
+    Extracted from `_resolve_user_from_auth0` so the property can be asserted
+    without standing up a database — the mutation is the security-relevant part,
+    and it should not be reachable only through a Session.
+
+    Clearing the hash is the half that is easy to miss. `verify_password` short-
+    circuits only on an EMPTY hash: a row created by the insert path gets
+    `password_hash=""` and is SSO-only, but an ADOPTED row keeps whatever hash it
+    had. Without the clear, that person keeps a working password and reaches the
+    dashboard without ever touching Auth0 — the revocation hole the SSO work
+    exists to close, left open on the account most likely to already have a
+    password. Not hypothetical: the POC admin is an adopted row with a real
+    address.
+
+    Safe to clear unconditionally. `ADMIN_API_KEY` is an independent break-glass
+    that never consults `users.password_hash`, so an operator is not locked out by
+    an Auth0 outage.
+    """
+    existing.auth0_sub = sub
+    existing.password_hash = ""
+
+
 def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
     """Map a verified Auth0 identity onto a `users` row, provisioning on first use.
 
@@ -194,7 +218,7 @@ def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
                     status_code=409,
                     detail="This email is already linked to a different SSO identity.",
                 )
-            existing.auth0_sub = claims.sub
+            adopt_row_into_sso(existing, claims.sub)
             user = existing
 
     if user is None:

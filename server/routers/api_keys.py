@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -60,7 +60,33 @@ def list_keys(user: User = Depends(require_auth), db: Session = Depends(get_db))
 
 
 @router.post("", response_model=CreateKeyResponse, status_code=201)
-def create_key(body: CreateKeyRequest, user: User = Depends(require_auth), db: Session = Depends(get_db)):
+def create_key(
+    request: Request, body: CreateKeyRequest, user: User = Depends(require_auth), db: Session = Depends(get_db)
+):
+    # An SSO caller may NOT mint a long-lived key.
+    #
+    # `X-API-Key` survives on purpose, for agents and CI that Auth0 has never
+    # heard of. The problem is the other direction: a human who reached this
+    # route with an Auth0 token walking away with a credential that Auth0 cannot
+    # revoke. `_resolve_user_from_api_key` consults neither Auth0 nor JumpCloud,
+    # so such a key keeps working after the person is disabled — the precise
+    # failure this server's SSO work exists to remove, reintroduced through the
+    # dashboard's "create API key" button.
+    #
+    # Gate on HOW THIS REQUEST AUTHENTICATED, not on `user.auth0_sub`. For an
+    # `ADMIN_API_KEY` or `AUTH_DISABLED` caller `require_auth` substitutes the
+    # OLDEST user row, which here is an adopted SSO account — so keying on the
+    # resolved user would break the break-glass path that exists to issue agent
+    # keys in the first place.
+    if getattr(request.state, "auth_type", "none") == "auth0":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "API keys cannot be created with an SSO session, because such a key would outlive "
+                "SSO revocation. Ask an operator to issue one for a non-human caller."
+            ),
+        )
+
     full_key, prefix, key_hash = generate_api_key()
     api_key = APIKey(key_prefix=prefix, key_hash=key_hash, label=body.label, created_by=user.id)
     db.add(api_key)
