@@ -169,12 +169,19 @@ def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
        person across two ids.
     3. Nothing matches — insert.
 
-    `role` is reconciled from the token on every call: the claim is the source of
-    truth, the column is a cache. That way granting or revoking `mcp-admin` in
-    Auth0 takes effect on the user's next request with no manual DB edit.
-    """
-    role = "admin" if claims.is_admin else "user"
+    `users.role` is NEVER set from the roles claim. Revision 004 created
+    `ix_users_only_one_admin`, a partial unique index over `role` where
+    `role = 'admin'`, so the table permits AT MOST ONE admin row — writing `admin`
+    for a second SSO caller is an IntegrityError, not a policy decision. Admin-ness
+    for Auth0 callers therefore lives in the claim and is read by `require_admin`
+    and `resolve_scope`, which is where it belongs: the claim is the source of
+    truth, and caching it in a uniqueness-constrained column could not represent
+    two admins even if it wanted to.
 
+    An adopted row keeps whatever `role` it already had — downgrading someone's
+    existing account as a side effect of their first SSO login would be a
+    surprising write, and `require_admin` no longer depends on it for this path.
+    """
     user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
 
     if user is None and claims.email:
@@ -198,12 +205,10 @@ def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
             email=claims.email or f"{claims.sub}@sso.invalid",
             name=claims.email or claims.sub,
             password_hash="",
-            role=role,
+            # Always "user" — see the note above about ix_users_only_one_admin.
+            role="user",
         )
         db.add(user)
-
-    if user.role != role:
-        user.role = role
 
     try:
         db.commit()
@@ -321,6 +326,16 @@ async def require_admin(
                 return default_user
             return _BOOTSTRAP_ADMIN
         raise HTTPException(status_code=401, detail="Authentication required.")
+    if auth_type == "auth0":
+        # Admin-ness comes from the roles claim, not `user.role`, which is always
+        # "user" for SSO rows — `ix_users_only_one_admin` (revision 004) permits at
+        # most one admin row, so the column cannot represent a second SSO admin.
+        # Checking the claim also means revoking `mcp-admin` in Auth0 takes effect
+        # on the caller's next request with no DB write.
+        claims: Auth0Claims = request.state.auth0_claims
+        if not claims.is_admin:
+            raise HTTPException(status_code=403, detail="Admin role required.")
+        return user
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin role required.")
     return user
