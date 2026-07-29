@@ -66,8 +66,22 @@ SENSITIVE_CONFIG_KEYS = {
 SKIPPED_REQUEST_LOG_PATHS = {"/api/health", "/docs", "/redoc", "/openapi.json"}
 SKIPPED_REQUEST_LOG_PREFIXES = ("/requests",)
 
-BUNDLED_LLM_PROVIDERS = ("openai", "anthropic", "gemini")
-BUNDLED_EMBEDDER_PROVIDERS = ("openai", "gemini")
+# evercompliant POC patch: ONE bundled provider, because there is one gateway.
+#
+# Every model this deployment reaches — Gemini and Anthropic included — is served
+# by bifrost over its OpenAI-compatible API, so the provider is always "openai"
+# with OPENAI_BASE_URL pointed at it (see MEM0_DEFAULT_LLM_MODEL and
+# OPENAI_BASE_URL in k8s/manifests/mem0-server-configmap.yaml). The vendor SDKs
+# behind "gemini" and "anthropic" were therefore never imported at runtime while
+# costing ~140MB of a 632MB image — google-generativeai drags in
+# google-api-python-client (99MB) on its own.
+#
+# Re-adding a provider means restoring its package in server/requirements.txt AND
+# in ai-utils' tools/mcp/mem0/server/pyproject.toml, which transcribes that file,
+# and re-running `aspect run //tools/mcp/mem0/server:lock`. Prefer pointing
+# bifrost at the model instead — that is the whole reason it is in front.
+BUNDLED_LLM_PROVIDERS = ("openai",)
+BUNDLED_EMBEDDER_PROVIDERS = ("openai",)
 
 
 def _warn_if_unconfigured() -> None:
