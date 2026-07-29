@@ -1,3 +1,4 @@
+import logging
 import os
 import secrets
 import uuid
@@ -240,9 +241,16 @@ async def verify_auth(
         if looks_like_auth0_token(token):
             try:
                 claims = verify_auth0_token(token)
-            except Auth0VerificationError:
-                # The reason is not echoed: it would tell an attacker whether a
-                # token failed on signature, audience, issuer or expiry.
+            except Auth0VerificationError as exc:
+                # Logged server-side, never echoed to the client: the operator
+                # needs to tell "the tenant is misconfigured" from "that token is
+                # genuinely bad", but telling the CALLER whether it failed on
+                # signature, audience, issuer or expiry is an oracle. Without this
+                # log a misconfiguration is indistinguishable from a bad token
+                # from the outside, which is a bad place to debug from.
+                logging.warning(
+                    "auth0: rejected a bearer token: %s (cause: %r)", exc, exc.__cause__
+                )
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid or expired token.",

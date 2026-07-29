@@ -121,7 +121,11 @@ class _JwksCache:
                     self._keys = self._fetch()
                     self._fetched_at = now
                 except Exception:
-                    logger.warning("auth0: JWKS fetch failed", exc_info=False)
+                    # exc_info so the cause is recoverable: degrading to the cached
+                    # keys is correct, but a silent degrade makes "the tenant is
+                    # unreachable" look identical to "that token is bad" from the
+                    # outside, which is a very bad place to debug from.
+                    logger.warning("auth0: JWKS fetch failed", exc_info=True)
                     # Fall through to whatever is still cached.
                 finally:
                     if kid not in self._keys:
