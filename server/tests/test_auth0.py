@@ -21,11 +21,15 @@ import unittest
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import HTTPException
 from jose import jwt
 from jose.utils import base64url_encode
+from starlette.requests import Request
 
 import auth0
+import rate_limit
 from auth import MemoryScope
+from routers import auth as auth_router
 
 DOMAIN = "test-tenant.us.auth0.com"
 AUDIENCE = "https://mem0.test.invalid"
@@ -236,6 +240,70 @@ class Auth0TokenTest(unittest.TestCase):
         token = self._sign(self._claims())
         auth0.AUTH0_DOMAIN = ""
         self._assert_rejected(token, "an unconfigured deployment must accept no Auth0 token")
+
+
+class RegistrationClosedUnderSsoTest(unittest.TestCase):
+    """`POST /auth/register` is unauthenticated and mints an `admin`.
+
+    Under SSO the handler refuses outright, but that guard lives in the function
+    body — it is invisible in `/openapi.json`, which lists the route with no
+    `security` entry. An audit reading the spec alone concludes the route is open,
+    and an empty-body probe returns 422 (FastAPI validating the body before the
+    handler runs), which reads as further confirmation. That false alarm has now
+    been raised twice.
+
+    So pin the guard where it actually has to be: FIRST in the body, ahead of the
+    password-length check and any database access. Every argument below is a
+    sentinel that would raise `AttributeError` if it were touched, so a future
+    refactor that moves the guard down fails here rather than in production.
+    """
+
+    def setUp(self) -> None:
+        self._restore = (auth0.AUTH0_DOMAIN, auth0.MEM0_AUDIENCE)
+        # Rate limiting is orthogonal, and slowapi's decorator reaches for
+        # `request.app` when enabled — which a bare Request does not carry.
+        self._limiter_enabled = rate_limit.limiter.enabled
+        rate_limit.limiter.enabled = False
+
+    def tearDown(self) -> None:
+        auth0.AUTH0_DOMAIN, auth0.MEM0_AUDIENCE = self._restore
+        rate_limit.limiter.enabled = self._limiter_enabled
+
+    @staticmethod
+    def _request() -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/auth/register",
+                "headers": [],
+                "client": ("203.0.113.1", 1234),
+            }
+        )
+
+    def test_register_is_refused_while_auth0_is_configured(self) -> None:
+        auth0.AUTH0_DOMAIN = DOMAIN
+        auth0.MEM0_AUDIENCE = AUDIENCE
+        self.assertTrue(auth0.auth0_enabled(), "precondition: this deployment accepts Auth0 tokens")
+
+        with self.assertRaises(HTTPException) as caught:
+            auth_router.register(request=self._request(), body=object(), db=object())
+
+        self.assertEqual(caught.exception.status_code, 403)
+
+    def test_the_guard_runs_before_the_body_is_read(self) -> None:
+        """A caller-supplied body must never reach validation on an SSO deployment."""
+        auth0.AUTH0_DOMAIN = DOMAIN
+        auth0.MEM0_AUDIENCE = AUDIENCE
+
+        class Exploding:
+            def __getattr__(self, name: str):
+                raise AssertionError(f"register() read body.{name} before refusing")
+
+        with self.assertRaises(HTTPException) as caught:
+            auth_router.register(request=self._request(), body=Exploding(), db=Exploding())
+
+        self.assertEqual(caught.exception.status_code, 403)
 
 
 class MemoryScopeTest(unittest.TestCase):
