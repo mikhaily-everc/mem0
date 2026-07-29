@@ -1,8 +1,10 @@
 import os
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from auth0 import Auth0Claims, Auth0VerificationError, looks_like_auth0_token, verify_auth0_token
 from db import get_db
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
@@ -10,6 +12,7 @@ from jose import JWTError, jwt
 from models import APIKey, RefreshTokenJti, User
 from passlib.context import CryptContext
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
@@ -27,6 +30,12 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
+    # An SSO-provisioned row has `password_hash = ""`. passlib raises on an empty
+    # hash rather than returning False, and an exception escaping here would be a
+    # 500 instead of a clean 401 — so short-circuit it. Without this, the password
+    # login path is the one place an SSO account could be reached without Auth0.
+    if not hashed:
+        return False
     return pwd_context.verify(plain, hashed)
 
 
@@ -141,16 +150,83 @@ def _resolve_user_from_api_key(key: str, db: Session) -> User:
     raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
+def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
+    """Map a verified Auth0 identity onto a `users` row, provisioning on first use.
+
+    The row is the durable anchor for everything already keyed on `users.id`
+    (API keys, request logs, `/auth/me`); the Auth0 token remains the only way to
+    authenticate as it, since `password_hash` stays empty.
+
+    `role` is reconciled from the token on every call: the claim is the source of
+    truth, the column is a cache. That way granting or revoking `mcp-admin` in
+    Auth0 takes effect on the user's next request with no manual DB edit.
+    """
+    user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
+    role = "admin" if claims.is_admin else "user"
+
+    if user is None:
+        user = User(
+            auth0_sub=claims.sub,
+            email=claims.email or f"{claims.sub}@sso.invalid",
+            name=claims.email or claims.sub,
+            password_hash="",
+            role=role,
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two concurrent first-time logins raced on the unique index (or on
+            # `email`). The loser rolls back and re-reads the winner's row — same
+            # pattern as the register handler in routers/auth.py.
+            db.rollback()
+            user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
+            if user is None:
+                raise HTTPException(status_code=500, detail="Could not provision SSO account.")
+        else:
+            db.refresh(user)
+
+    if user.role != role:
+        user.role = role
+        db.commit()
+
+    return user
+
+
 async def verify_auth(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     x_api_key: str | None = Depends(api_key_header),
     db: Session = Depends(get_db),
 ) -> User | None:
-    """Authenticate via JWT, X-API-Key, or legacy ADMIN_API_KEY. Returns User or None."""
+    """Authenticate via Auth0 RS256, native HS256 JWT, X-API-Key, or legacy ADMIN_API_KEY.
+
+    Returns a User, or None for the credential-less admin paths (ADMIN_API_KEY and
+    AUTH_DISABLED), which callers distinguish via `request.state.auth_type`.
+    """
     if credentials is not None:
+        token = credentials.credentials
+        # Route by key type, not by trying one and falling back: an RS256 token
+        # with a `kid` can only be Auth0's, and the native path is HS256 with no
+        # `kid`. Falling back would let a rejected Auth0 token be re-tried against
+        # the shared HS256 secret.
+        if looks_like_auth0_token(token):
+            try:
+                claims = verify_auth0_token(token)
+            except Auth0VerificationError:
+                # The reason is not echoed: it would tell an attacker whether a
+                # token failed on signature, audience, issuer or expiry.
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or expired token.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            _mark_auth_type(request, "auth0")
+            request.state.auth0_claims = claims
+            return _resolve_user_from_auth0(claims, db)
+
         _mark_auth_type(request, "bearer")
-        return _resolve_user_from_jwt(credentials.credentials, db)
+        return _resolve_user_from_jwt(token, db)
 
     if x_api_key is not None:
         if ADMIN_API_KEY and secrets.compare_digest(x_api_key, ADMIN_API_KEY):
@@ -213,3 +289,67 @@ async def require_admin(
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin role required.")
     return user
+
+
+# ---------------------------------------------------------------------------
+# Memory scope
+#
+# The bug this exists to close: every memory route resolved an identity and then
+# discarded it, taking `user_id` from the request body instead. So authentication
+# never implied isolation — any caller could read, overwrite or delete any other
+# caller's memories just by naming their `user_id`, or by omitting it and reading
+# the shared pool.
+#
+# The fix is deliberately an EXPLICIT dependency rather than something stashed on
+# `request.state`. A route that needs scoping and forgets to ask for it is then a
+# visible omission in its signature, which is reviewable; an implicit lookup that
+# silently returns "unscoped" is exactly how the original hole survived.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MemoryScope:
+    """Which memories the current caller may see and write.
+
+    `pinned_user_id` is non-None only for Auth0 callers. The legacy credential
+    paths (native HS256 JWT, `X-API-Key`, `ADMIN_API_KEY`, `AUTH_DISABLED`) keep
+    the pre-existing caller-supplied behaviour so agents and CI do not break; see
+    the `X-API-Key` note in the deployment docs.
+    """
+
+    pinned_user_id: str | None
+    is_admin: bool
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.pinned_user_id is not None
+
+    def pin(self, requested: str | None) -> str | None:
+        """The `user_id` to actually use, ignoring whatever the caller asked for."""
+        return self.pinned_user_id if self.is_pinned else requested
+
+    def owns(self, stored_user_id: str | None) -> bool:
+        """Whether a stored memory belongs to this caller.
+
+        Unpinned callers retain full access. A pinned caller matches only their own
+        scope — note a stored `None` never matches, so pre-existing unscoped
+        memories become unreachable rather than shared.
+        """
+        if not self.is_pinned:
+            return True
+        return stored_user_id == self.pinned_user_id
+
+
+async def resolve_scope(
+    request: Request,
+    user: User | None = Depends(verify_auth),
+) -> MemoryScope:
+    """Derive the caller's memory scope from their verified credential."""
+    auth_type = getattr(request.state, "auth_type", "none")
+    if auth_type == "auth0":
+        claims: Auth0Claims = request.state.auth0_claims
+        # Admin-ness governs the "list everything" branch only; it deliberately
+        # does NOT unpin the scope, so an admin's own reads and writes still land
+        # in their own scope rather than the shared pool.
+        return MemoryScope(pinned_user_id=claims.memory_scope, is_admin=claims.is_admin)
+    return MemoryScope(pinned_user_id=None, is_admin=(user is None or user.role == "admin"))

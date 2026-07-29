@@ -1,0 +1,281 @@
+"""Tests for Auth0 token verification and memory-scope pinning.
+
+These cover the rejection cases that are awkward to produce against a live tenant
+(`alg: none`, a token signed by the wrong key, a wrong audience or issuer) by
+signing tokens locally with a throwaway RSA key and seeding the JWKS cache with
+its public half. No network, no database.
+
+stdlib `unittest` rather than pytest, deliberately. rules_py's `uv.project`
+derives the wheel hub's dep-group config settings from the resolved graph, and
+adding a PEP 735 `[dependency-groups]` block to pyproject.toml made the hub emit
+ONLY that group — the `mem0_server` group disappeared and every
+`@pypi_mem0//<pkg>` label failed at analysis. `unittest` needs nothing added to
+the lock, so the shipped image's dependency graph stays untouched.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import unittest
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jose import jwt
+from jose.utils import base64url_encode
+
+import auth0
+from auth import MemoryScope
+
+DOMAIN = "test-tenant.us.auth0.com"
+AUDIENCE = "https://mem0.test.invalid"
+ISSUER = f"https://{DOMAIN}/"
+ROLES_CLAIM = "https://everc.io/roles"
+KID = "test-key-1"
+SUB = "samlp|SAML-JumpCloud-Dev|someone@everc.com"
+
+
+def _int_to_b64(value: int) -> str:
+    return base64url_encode(value.to_bytes((value.bit_length() + 7) // 8, "big")).decode()
+
+
+def _new_key() -> tuple[str, dict]:
+    """A throwaway RSA key as (PEM private key, public JWK)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    numbers = key.public_key().public_numbers()
+    return pem, {
+        "kty": "RSA",
+        "kid": KID,
+        "use": "sig",
+        "alg": "RS256",
+        "n": _int_to_b64(numbers.n),
+        "e": _int_to_b64(numbers.e),
+    }
+
+
+class Auth0TokenTest(unittest.TestCase):
+    """Verification of a real RS256 token against a seeded JWKS."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # 2048-bit keygen is slow enough to be worth doing once for the class.
+        cls.pem, cls.jwk = _new_key()
+
+    def setUp(self) -> None:
+        self._restore = {
+            "AUTH0_DOMAIN": auth0.AUTH0_DOMAIN,
+            "MEM0_AUDIENCE": auth0.MEM0_AUDIENCE,
+            "AUTH0_ROLES_CLAIM": auth0.AUTH0_ROLES_CLAIM,
+            "MEM0_ADMIN_ROLE": auth0.MEM0_ADMIN_ROLE,
+        }
+        auth0.AUTH0_DOMAIN = DOMAIN
+        auth0.MEM0_AUDIENCE = AUDIENCE
+        auth0.AUTH0_ROLES_CLAIM = ROLES_CLAIM
+        auth0.MEM0_ADMIN_ROLE = "mcp-admin"
+        # Seed the cache and stub the fetch to serve the same key offline.
+        #
+        # Counting rather than failing on fetch: `_JwksCache.get` swallows every
+        # exception from `_fetch` (so a JWKS outage degrades to the cached keys
+        # instead of 500ing), which means an `assert`/`fail` raised in here would
+        # be silently absorbed and the guard would never fire. A counter checked
+        # from the test body cannot be swallowed.
+        self.fetch_count = 0
+        auth0._jwks._keys = {KID: self.jwk}
+        auth0._jwks._fetched_at = time.monotonic()
+        auth0._jwks._last_miss_fetch = 0.0
+        auth0._jwks._fetch = self._counting_fetch
+
+    def _counting_fetch(self) -> dict[str, dict]:
+        self.fetch_count += 1
+        return {KID: self.jwk}
+
+    def tearDown(self) -> None:
+        for name, value in self._restore.items():
+            setattr(auth0, name, value)
+        auth0._jwks.clear()
+
+    # -- helpers ----------------------------------------------------------- #
+
+    def _claims(self, **overrides) -> dict:
+        claims = {
+            "sub": SUB,
+            "aud": AUDIENCE,
+            "iss": ISSUER,
+            "exp": int(time.time()) + 300,
+            "iat": int(time.time()),
+            "email": "someone@everc.com",
+            ROLES_CLAIM: [],
+        }
+        claims.update(overrides)
+        return claims
+
+    def _sign(self, claims: dict, *, kid: str = KID, pem: str | None = None) -> str:
+        return jwt.encode(claims, pem or self.pem, algorithm="RS256", headers={"kid": kid})
+
+    def _assert_rejected(self, token: str, because: str) -> None:
+        with self.assertRaises(auth0.Auth0VerificationError, msg=because):
+            auth0.verify_auth0_token(token)
+
+    # -- acceptance -------------------------------------------------------- #
+
+    def test_accepts_a_valid_token(self) -> None:
+        result = auth0.verify_auth0_token(self._sign(self._claims()))
+        self.assertEqual(result.sub, SUB)
+        self.assertEqual(result.email, "someone@everc.com")
+        self.assertFalse(result.is_admin)
+        # A warm cache must not be re-fetched on every request.
+        self.assertEqual(self.fetch_count, 0)
+
+    def test_memory_scope_is_derived_from_sub(self) -> None:
+        result = auth0.verify_auth0_token(self._sign(self._claims()))
+        self.assertEqual(result.memory_scope, f"auth0:{SUB}")
+
+    def test_admin_role_is_read_from_the_namespaced_claim(self) -> None:
+        token = self._sign(self._claims(**{ROLES_CLAIM: ["other", "mcp-admin"]}))
+        self.assertTrue(auth0.verify_auth0_token(token).is_admin)
+
+    def test_a_non_list_roles_claim_does_not_crash(self) -> None:
+        result = auth0.verify_auth0_token(self._sign(self._claims(**{ROLES_CLAIM: "mcp-admin"})))
+        self.assertEqual(result.roles, ())
+        self.assertFalse(result.is_admin)
+
+    def test_missing_email_yields_empty_string(self) -> None:
+        claims = self._claims()
+        del claims["email"]
+        self.assertEqual(auth0.verify_auth0_token(self._sign(claims)).email, "")
+
+    # -- rejection: each of these was a way in before the change ----------- #
+
+    def test_rejects_wrong_audience(self) -> None:
+        self._assert_rejected(
+            self._sign(self._claims(aud="https://someone-elses-api.invalid")),
+            "a token minted for another API must not be accepted here",
+        )
+
+    def test_rejects_wrong_issuer(self) -> None:
+        self._assert_rejected(
+            self._sign(self._claims(iss="https://evil.us.auth0.com/")),
+            "another tenant must not be able to mint tokens for us",
+        )
+
+    def test_rejects_expired_token(self) -> None:
+        self._assert_rejected(
+            self._sign(self._claims(exp=int(time.time()) - 60)),
+            "expiry is what makes Auth0 revocation propagate",
+        )
+
+    def test_rejects_alg_none(self) -> None:
+        header = base64url_encode(
+            json.dumps({"alg": "none", "typ": "JWT", "kid": KID}).encode()
+        ).decode()
+        payload = base64url_encode(json.dumps(self._claims()).encode()).decode()
+        self._assert_rejected(f"{header}.{payload}.", "an unsigned token is not a credential")
+
+    def test_rejects_hs256_signed_with_the_public_key(self) -> None:
+        """Algorithm confusion: sign with the public modulus as an HMAC secret."""
+        token = jwt.encode(self._claims(), self.jwk["n"], algorithm="HS256", headers={"kid": KID})
+        self._assert_rejected(token, "the algorithm must come from our allowlist, not the token")
+
+    def test_rejects_unknown_kid(self) -> None:
+        self._assert_rejected(
+            self._sign(self._claims(), kid="not-a-key-we-know"),
+            "an unknown kid must not fall back to some other key",
+        )
+        # An unknown kid is the key-rotation signal, so ONE refetch is correct —
+        # but it must not then accept the token under a different key.
+        self.assertEqual(self.fetch_count, 1)
+
+    def test_repeated_unknown_kids_do_not_amplify_fetches(self) -> None:
+        """A stream of bogus kids must not become a request amplifier at Auth0."""
+        for i in range(5):
+            self._assert_rejected(
+                self._sign(self._claims(), kid=f"bogus-{i}"),
+                "a bogus kid must be rejected",
+            )
+        self.assertEqual(self.fetch_count, 1)
+
+    def test_rejects_signature_from_another_key(self) -> None:
+        other_pem, _ = _new_key()
+        self._assert_rejected(
+            self._sign(self._claims(), pem=other_pem),
+            "the kid must actually match the verifying key",
+        )
+
+    def test_rejects_token_with_no_sub(self) -> None:
+        claims = self._claims()
+        del claims["sub"]
+        self._assert_rejected(self._sign(claims), "no sub means no scope to pin memories to")
+
+    def test_rejects_token_with_empty_sub(self) -> None:
+        self._assert_rejected(self._sign(self._claims(sub="")), "an empty sub is not an identity")
+
+    def test_rejects_garbage(self) -> None:
+        self._assert_rejected("not-a-jwt-at-all", "malformed input must not raise past the caller")
+
+    # -- routing triage ---------------------------------------------------- #
+
+    def test_looks_like_auth0_token_accepts_rs256_with_kid(self) -> None:
+        self.assertTrue(auth0.looks_like_auth0_token(self._sign(self._claims())))
+
+    def test_looks_like_auth0_token_rejects_the_native_hs256_token(self) -> None:
+        """The mem0-native path is HS256 with no kid, so the two are unambiguous."""
+        native = jwt.encode({"sub": "x", "type": "access"}, "shared-secret", algorithm="HS256")
+        self.assertFalse(auth0.looks_like_auth0_token(native))
+
+    def test_looks_like_auth0_token_is_false_when_unconfigured(self) -> None:
+        token = self._sign(self._claims())
+        auth0.MEM0_AUDIENCE = ""
+        self.assertFalse(auth0.looks_like_auth0_token(token))
+
+    def test_verify_refuses_when_unconfigured(self) -> None:
+        token = self._sign(self._claims())
+        auth0.AUTH0_DOMAIN = ""
+        self._assert_rejected(token, "an unconfigured deployment must accept no Auth0 token")
+
+
+class MemoryScopeTest(unittest.TestCase):
+    """The pinning contract every memory route relies on."""
+
+    PINNED = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+
+    def test_pin_overwrites_a_caller_supplied_user_id(self) -> None:
+        self.assertEqual(self.PINNED.pin("bob"), "auth0:alice")
+
+    def test_pin_fills_in_a_missing_user_id(self) -> None:
+        self.assertEqual(self.PINNED.pin(None), "auth0:alice")
+
+    def test_pin_is_a_passthrough_when_unpinned(self) -> None:
+        self.assertEqual(self.UNPINNED.pin("bob"), "bob")
+        self.assertIsNone(self.UNPINNED.pin(None))
+
+    def test_owns_only_the_callers_own_scope(self) -> None:
+        self.assertTrue(self.PINNED.owns("auth0:alice"))
+        self.assertFalse(self.PINNED.owns("auth0:bob"))
+
+    def test_owns_rejects_unscoped_rows_for_a_pinned_caller(self) -> None:
+        """Memories written before pinning become unreachable, not shared."""
+        self.assertFalse(self.PINNED.owns(None))
+
+    def test_unpinned_callers_retain_full_access(self) -> None:
+        self.assertTrue(self.UNPINNED.owns("anything"))
+        self.assertTrue(self.UNPINNED.owns(None))
+
+    def test_admin_does_not_unpin_the_scope(self) -> None:
+        """An SSO admin may list broadly, but their reads and writes stay in scope."""
+        admin = MemoryScope(pinned_user_id="auth0:alice", is_admin=True)
+        self.assertEqual(admin.pin("bob"), "auth0:alice")
+        self.assertFalse(admin.owns("auth0:bob"))
+
+    def test_is_pinned_reflects_the_presence_of_a_scope(self) -> None:
+        self.assertTrue(self.PINNED.is_pinned)
+        self.assertFalse(self.UNPINNED.is_pinned)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -17,6 +17,7 @@ from auth import (
     require_auth,
     verify_password,
 )
+from auth0 import auth0_enabled
 from db import get_db
 from models import User
 from rate_limit import limiter
@@ -87,6 +88,10 @@ class SetupStatusResponse(BaseModel):
 
 @router.get("/setup-status", response_model=SetupStatusResponse)
 def setup_status(db: Session = Depends(get_db)):
+    # This route is unauthenticated. Under SSO there is no setup step to perform,
+    # so answer False without disclosing whether the users table is empty.
+    if auth0_enabled():
+        return SetupStatusResponse(needsSetup=False)
     count = db.scalar(select(func.count(User.id)))
     return SetupStatusResponse(needsSetup=count == 0)
 
@@ -95,6 +100,17 @@ def setup_status(db: Session = Depends(get_db)):
 @limiter.limit("5/minute")
 def register(request: Request, body: RegisterRequest, db: Session = Depends(get_db)):
     """Create the first admin account. Blocked once any user exists."""
+    # This route is UNAUTHENTICATED and mints an `admin`. Its only guard is that
+    # the users table is empty, so on a fresh deployment anything that can reach
+    # the pod could claim admin before a real user first logged in. Under SSO,
+    # accounts are provisioned from a verified Auth0 token instead, so there is no
+    # legitimate caller left — close the route outright rather than leave the race.
+    if auth0_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Registration is disabled. Accounts are provisioned from SSO.",
+        )
+
     _require_password_length(body.password)
 
     if db.scalar(select(func.count(User.id))) > 0:

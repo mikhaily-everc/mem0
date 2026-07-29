@@ -21,8 +21,15 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=_new_uuid)
     name: Mapped[str] = mapped_column(String(255))
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    #: Empty for SSO-provisioned accounts, which have no password to verify.
+    #: `verify_password` must never treat that as a match — see `auth.py`.
     password_hash: Mapped[str] = mapped_column(Text)
     role: Mapped[str] = mapped_column(String(20), default="admin")
+    #: Auth0 `sub` of the SSO identity that owns this row (e.g.
+    #: `samlp|SAML-JumpCloud-Dev|someone@everc.com`), or NULL for a local
+    #: password account. Unique so two concurrent first-time logins cannot
+    #: provision two rows for the same person and split their memories.
+    auth0_sub: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

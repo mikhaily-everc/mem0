@@ -5,7 +5,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 import telemetry
-from auth import ADMIN_API_KEY, AUTH_DISABLED, JWT_SECRET, require_admin, verify_auth
+from auth import (
+    ADMIN_API_KEY,
+    AUTH_DISABLED,
+    JWT_SECRET,
+    MemoryScope,
+    require_admin,
+    resolve_scope,
+    verify_auth,
+)
 from db import SessionLocal
 from dotenv import load_dotenv
 from errors import (
@@ -383,12 +391,24 @@ def generate_instructions(req: GenerateInstructionsRequest, _auth=Depends(verify
 
 
 @app.post("/memories", summary="Create memories")
-def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
+def add_memory(memory_create: MemoryCreate, scope: MemoryScope = Depends(resolve_scope)):
     """Store new memories."""
-    if not any([memory_create.user_id, memory_create.agent_id, memory_create.run_id]):
+    params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
+
+    # Overwrite before validating, not after: a pinned caller supplies no
+    # `user_id` at all (the tool schema no longer offers one), so the
+    # "at least one identifier" check below would reject every request if it ran
+    # first. Assigning into `params` rather than the model keeps the request body
+    # untouched for logging.
+    pinned = scope.pin(memory_create.user_id)
+    if pinned is not None:
+        params["user_id"] = pinned
+    elif "user_id" in params:
+        del params["user_id"]
+
+    if not any([params.get("user_id"), params.get("agent_id"), params.get("run_id")]):
         raise HTTPException(status_code=400, detail="At least one identifier (user_id, agent_id, run_id) is required.")
 
-    params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
     try:
         response = get_memory_instance().add(messages=[m.model_dump() for m in memory_create.messages], **params)
         if response.get("results"):
@@ -435,14 +455,19 @@ def get_all_memories(
     top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
     show_expired: bool = Query(False),
     _auth=Depends(verify_auth),
+    scope: MemoryScope = Depends(resolve_scope),
 ):
     """Retrieve stored memories. Lists all memories when no identifier is provided (admin only)."""
     try:
+        user_id = scope.pin(user_id)
         if not any([user_id, run_id, agent_id]):
             auth_type = getattr(request.state, "auth_type", "none")
             if _auth is not None and _auth.role != "admin" and auth_type not in {"admin_api_key", "disabled"}:
                 raise HTTPException(status_code=403, detail="Admin role required to list all memories.")
             # Admin all-memory listing is intentionally raw; scoped get_all below applies expiry visibility.
+            # Unreachable for a pinned caller: `scope.pin` always yields a user_id,
+            # so even an admin SSO caller takes the scoped branch and cannot read
+            # the whole store through this route.
             return _list_all_memories(limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT)
         filters = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
@@ -458,20 +483,37 @@ def get_all_memories(
         raise upstream_error()
 
 
-@app.get("/memories/{memory_id}", summary="Get a memory")
-def get_memory(memory_id: str, _auth=Depends(verify_auth)):
-    """Retrieve a specific memory by ID."""
+def _fetch_owned_memory(memory_id: str, scope: MemoryScope) -> Dict[str, Any]:
+    """Fetch a memory by id, or 404 if it does not exist OR is not the caller's.
+
+    404 rather than 403 for the not-yours case, deliberately: a 403 would confirm
+    that a given id exists, turning these routes into an id oracle. The two cases
+    are indistinguishable from outside.
+    """
     try:
-        return get_memory_instance().get(memory_id)
+        memory = get_memory_instance().get(memory_id)
     except Exception:
         raise upstream_error()
 
+    if memory is None:
+        raise HTTPException(status_code=404, detail="Memory not found.")
+    owner = memory.get("user_id") if isinstance(memory, dict) else None
+    if not scope.owns(owner):
+        raise HTTPException(status_code=404, detail="Memory not found.")
+    return memory
+
+
+@app.get("/memories/{memory_id}", summary="Get a memory")
+def get_memory(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
+    """Retrieve a specific memory by ID."""
+    return _fetch_owned_memory(memory_id, scope)
+
 
 @app.post("/search", summary="Search memories")
-def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
+def search_memories(search_req: SearchRequest, scope: MemoryScope = Depends(resolve_scope)):
     """Search for memories based on a query."""
     try:
-        filters = search_req.filters or {}
+        filters = dict(search_req.filters or {})
         deprecated_keys = []
         for entity_key in ("user_id", "agent_id", "run_id"):
             entity_val = getattr(search_req, entity_key, None)
@@ -484,6 +526,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
                 ", ".join(deprecated_keys),
                 ", ".join(f'"{k}": "..."' for k in deprecated_keys),
             )
+        # Pin `filters["user_id"]`, NOT just the deprecated top-level field.
+        # `filters` is a free-form passthrough dict and upstream's own deprecation
+        # notice tells callers to put `user_id` in it, so pinning only the
+        # top-level field would leave the documented route wide open.
+        if scope.is_pinned:
+            filters["user_id"] = scope.pinned_user_id
         params = {}
         if search_req.top_k is not None:
             params["top_k"] = search_req.top_k
@@ -503,8 +551,13 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
 
 
 @app.put("/memories/{memory_id}", summary="Update a memory")
-def update_memory(memory_id: str, updated_memory: MemoryUpdate, _auth=Depends(verify_auth)):
+def update_memory(
+    memory_id: str,
+    updated_memory: MemoryUpdate,
+    scope: MemoryScope = Depends(resolve_scope),
+):
     """Update an existing memory."""
+    _fetch_owned_memory(memory_id, scope)
     try:
         fields_set = getattr(updated_memory, "model_fields_set", getattr(updated_memory, "__fields_set__", set()))
         params = {"memory_id": memory_id}
@@ -522,8 +575,9 @@ def update_memory(memory_id: str, updated_memory: MemoryUpdate, _auth=Depends(ve
 
 
 @app.get("/memories/{memory_id}/history", summary="Get memory history")
-def memory_history(memory_id: str, _auth=Depends(verify_auth)):
+def memory_history(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
     """Retrieve memory history."""
+    _fetch_owned_memory(memory_id, scope)
     try:
         return get_memory_instance().history(memory_id=memory_id)
     except Exception:
@@ -531,8 +585,9 @@ def memory_history(memory_id: str, _auth=Depends(verify_auth)):
 
 
 @app.delete("/memories/{memory_id}", summary="Delete a memory", response_model=MessageResponse)
-def delete_memory(memory_id: str, _auth=Depends(verify_auth)):
+def delete_memory(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
     """Delete a specific memory by ID."""
+    _fetch_owned_memory(memory_id, scope)
     try:
         get_memory_instance().delete(memory_id=memory_id)
         return MessageResponse(message="Memory deleted successfully")
@@ -548,8 +603,15 @@ def delete_all_memories(
     run_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     _auth=Depends(require_admin),
+    scope: MemoryScope = Depends(resolve_scope),
 ):
     """Delete all memories for a given identifier. Requires admin role."""
+    # An SSO admin is still pinned to their own scope here. Admin-ness governs
+    # what you can LIST, not whose memories you can destroy — otherwise every
+    # `mcp-admin` holder could wipe a colleague's memories by naming their
+    # `user_id`. Operational cross-scope cleanup remains available through the
+    # machine credential (ADMIN_API_KEY), which is unpinned by design.
+    user_id = scope.pin(user_id)
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
     try:
@@ -563,8 +625,16 @@ def delete_all_memories(
 
 
 @app.post("/reset", summary="Reset all memories")
-def reset_memory(_auth=Depends(require_admin)):
+def reset_memory(_auth=Depends(require_admin), scope: MemoryScope = Depends(resolve_scope)):
     """Completely reset stored memories. Requires admin role."""
+    # Inherently cross-scope: there is no way to express "reset only mine" here.
+    # Refuse it for a pinned (SSO) caller rather than silently wiping everyone.
+    if scope.is_pinned:
+        raise HTTPException(
+            status_code=403,
+            detail="Reset affects every user's memories and is not available to SSO callers. "
+            "Use DELETE /memories to clear your own.",
+        )
     try:
         get_memory_instance().reset()
         return {"message": "All memories reset"}

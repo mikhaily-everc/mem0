@@ -20,6 +20,9 @@ passlib[bcrypt]>=1.7,<2.0
 bcrypt==4.0.1
 python-jose[cryptography]>=3.3,<4.0
 cryptography>46.0.4
+# Auth0 JWKS fetch in auth0.py. Already present transitively via openai, but
+# auth0.py imports it directly, so it is declared directly.
+httpx>=0.27,<1.0
 
 # Anonymous telemetry — on by default, opt out with MEM0_TELEMETRY=false
 posthog>=3.0,<8.0

@@ -2,9 +2,9 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from auth import require_admin, verify_auth
+from auth import MemoryScope, require_admin, resolve_scope
 from errors import upstream_error
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from schemas import MessageResponse
 from server_state import get_memory_instance
@@ -41,12 +41,23 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 
 
 @router.get("", response_model=list[Entity])
-def list_entities(_auth=Depends(verify_auth)):
+def list_entities(scope: MemoryScope = Depends(resolve_scope)):
+    """List the entities present in the caller's own memories.
+
+    Unscoped, this route was the widest read in the API: an unfiltered 10k-row
+    vector-store scan that hands any authenticated caller every `user_id`,
+    `agent_id` and `run_id` in the store with per-entity counts. Unlike
+    `GET /memories` it had no admin branch at all, so a plain user saw everything.
+    """
     buckets: dict[tuple[EntityType, str], dict[str, Any]] = defaultdict(
         lambda: {"total_memories": 0, "created_at": None, "updated_at": None}
     )
 
     for payload in _iter_payloads():
+        # Drop rows the caller does not own BEFORE bucketing, so no foreign
+        # agent_id or run_id can be inferred from a shared memory either.
+        if not scope.owns(payload.get("user_id")):
+            continue
         created = _parse_timestamp(payload.get("created_at"))
         updated = _parse_timestamp(payload.get("updated_at")) or created
 
@@ -68,7 +79,17 @@ def list_entities(_auth=Depends(verify_auth)):
 
 
 @router.delete("/{entity_type}/{entity_id}", response_model=MessageResponse)
-def delete_entity(entity_type: EntityType, entity_id: str, _auth=Depends(require_admin)):
+def delete_entity(
+    entity_type: EntityType,
+    entity_id: str,
+    _auth=Depends(require_admin),
+    scope: MemoryScope = Depends(resolve_scope),
+):
+    # A pinned caller may only delete their own `user` entity. Without this an
+    # `mcp-admin` holder could delete a colleague's entire memory set by id, and
+    # for agent/run entities there is no owner field to check against at all.
+    if scope.is_pinned and not (entity_type == "user" and entity_id == scope.pinned_user_id):
+        raise HTTPException(status_code=404, detail="Entity not found.")
     try:
         get_memory_instance().delete_all(**{TYPE_TO_FIELD[entity_type]: entity_id})
     except Exception:
