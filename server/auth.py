@@ -157,39 +157,66 @@ def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
     (API keys, request logs, `/auth/me`); the Auth0 token remains the only way to
     authenticate as it, since `password_hash` stays empty.
 
+    Three cases, in order:
+
+    1. A row already carries this `auth0_sub` — use it.
+    2. A row carries the same `email` but no `auth0_sub` — ADOPT it. This is the
+       normal upgrade path for anyone who had a password account before SSO (and
+       is not hypothetical: the POC admin account exists with a real address).
+       Inserting instead would violate the unique `email` index and strand the
+       user behind a 500, and even if `email` were not unique it would split one
+       person across two ids.
+    3. Nothing matches — insert.
+
     `role` is reconciled from the token on every call: the claim is the source of
     truth, the column is a cache. That way granting or revoking `mcp-admin` in
     Auth0 takes effect on the user's next request with no manual DB edit.
     """
-    user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
     role = "admin" if claims.is_admin else "user"
+
+    user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
+
+    if user is None and claims.email:
+        existing = db.scalar(select(User).where(User.email == claims.email))
+        if existing is not None:
+            if existing.auth0_sub not in (None, claims.sub):
+                # Same address, different SSO subject. Adopting would hand this
+                # caller another identity's memories, so fail closed instead.
+                raise HTTPException(
+                    status_code=409,
+                    detail="This email is already linked to a different SSO identity.",
+                )
+            existing.auth0_sub = claims.sub
+            user = existing
 
     if user is None:
         user = User(
             auth0_sub=claims.sub,
+            # A token with no `email` claim still needs a value for the NOT NULL
+            # unique column; key it on the sub so it cannot collide.
             email=claims.email or f"{claims.sub}@sso.invalid",
             name=claims.email or claims.sub,
             password_hash="",
             role=role,
         )
         db.add(user)
-        try:
-            db.commit()
-        except IntegrityError:
-            # Two concurrent first-time logins raced on the unique index (or on
-            # `email`). The loser rolls back and re-reads the winner's row — same
-            # pattern as the register handler in routers/auth.py.
-            db.rollback()
-            user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
-            if user is None:
-                raise HTTPException(status_code=500, detail="Could not provision SSO account.")
-        else:
-            db.refresh(user)
 
     if user.role != role:
         user.role = role
-        db.commit()
 
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two concurrent first-time logins raced on the unique index. The loser
+        # rolls back and re-reads the winner's row — same pattern as the register
+        # handler in routers/auth.py.
+        db.rollback()
+        user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
+        if user is None:
+            raise HTTPException(status_code=500, detail="Could not provision SSO account.")
+        return user
+
+    db.refresh(user)
     return user
 
 
