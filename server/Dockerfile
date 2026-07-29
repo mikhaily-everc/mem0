@@ -12,4 +12,6 @@ EXPOSE 8000
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# evercompliant POC patch: upstream ships dev mode (--reload watches the FS and forks
+# a reloader process) — wrong for a deployed image.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

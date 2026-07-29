@@ -115,6 +115,16 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
 DEFAULT_LLM_MODEL = os.environ.get("MEM0_DEFAULT_LLM_MODEL", "gpt-4.1-nano-2025-04-14")
 DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-embedding-3-small")
+# evercompliant POC patch: upstream has no env for embedding dims, but without it the
+# openai embedder never sends `dimensions` and the pgvector store defaults the memories
+# table to VECTOR(1536) — both wrong for Nova embeddings pinned to 1024 via bifrost.
+_EMBEDDING_DIMS_ENV = os.environ.get("MEM0_EMBEDDING_DIMS")
+EMBEDDING_DIMS = int(_EMBEDDING_DIMS_ENV) if _EMBEDDING_DIMS_ENV else None
+# evercompliant POC patch: the pgvector store's psycopg pool defaults to min_size=1 — a
+# permanently-idle connection that blocks Aurora Serverless v2 auto-pause. minconn=0 is
+# valid (max_size stays at the maxconn default 5); idle connections then drain after the
+# pool's max_idle (600s), letting the cluster pause.
+PG_MINCONN = int(os.environ.get("MEM0_PG_MINCONN", "1"))
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -127,13 +137,22 @@ DEFAULT_CONFIG = {
             "user": POSTGRES_USER,
             "password": POSTGRES_PASSWORD,
             "collection_name": POSTGRES_COLLECTION_NAME,
+            "minconn": PG_MINCONN,
+            **({"embedding_model_dims": EMBEDDING_DIMS} if EMBEDDING_DIMS else {}),
         },
     },
     "llm": {
         "provider": "openai",
         "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
     },
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL}},
+    "embedder": {
+        "provider": "openai",
+        "config": {
+            "api_key": OPENAI_API_KEY,
+            "model": DEFAULT_EMBEDDER_MODEL,
+            **({"embedding_dims": EMBEDDING_DIMS} if EMBEDDING_DIMS else {}),
+        },
+    },
     "history_db_path": HISTORY_DB_PATH,
 }
 
