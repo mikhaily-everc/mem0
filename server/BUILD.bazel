@@ -1,0 +1,98 @@
+"""Bazel view of upstream mem0's FastAPI app (server/).
+
+Overlay-only: upstream mem0ai/mem0 ships no BUILD files, and its own packaging is
+a Dockerfile that `pip install -r requirements.txt` then `COPY . .` into /app.
+This library reproduces that import surface for rules_py.
+
+`imports = ["."]` is the load-bearing line. Upstream sets WORKDIR /app and runs
+`uvicorn main:app`, so every module here is a TOP-LEVEL import (`main`, `db`,
+`auth`, `models`, `routers.*`) — not `server.main`. Dropping this makes the app
+import cleanly on a developer's machine and fail only inside the container.
+"""
+
+load("@bazel_lib//lib:transitions.bzl", "platform_transition_test")
+load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
+
+package(default_visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"])
+
+py_library(
+    name = "server",
+    srcs = glob(
+        ["**/*.py"],
+        allow_empty = False,
+        exclude = [
+            # Upstream's Streamlit operator UI. Not served by the API container
+            # and pulls streamlit, which is deliberately absent from uv.lock.
+            "dashboard/**",
+            # Tests are their own target below. Excluded here so they stay out of
+            # the py_binary closure and therefore out of the shipped image.
+            "tests/**",
+        ],
+    ),
+    data = glob(
+        [
+            "alembic.ini",
+            "alembic/**",
+        ],
+        allow_empty = False,
+    ),
+    imports = ["."],
+    deps = [
+        "@pypi_mem0//alembic",
+        "@pypi_mem0//bcrypt",
+        "@pypi_mem0//cryptography",
+        "@pypi_mem0//fastapi",
+        # No anthropic, no google_generativeai: BUNDLED_*_PROVIDERS in
+        # server/main.py is ("openai",) alone, because every model is served
+        # through bifrost's OpenAI-compatible API.
+        # Auth0 JWKS fetch in server/auth0.py. Already in the resolved graph via
+        # openai/qdrant-client, but this deps list is explicit, so a transitive
+        # presence is not enough to import it.
+        "@pypi_mem0//httpx",
+        "@pypi_mem0//mem0ai",
+        "@pypi_mem0//passlib",
+        "@pypi_mem0//posthog",
+        "@pypi_mem0//psycopg",
+        "@pypi_mem0//psycopg_pool",
+        "@pypi_mem0//pydantic",
+        "@pypi_mem0//python_dotenv",
+        "@pypi_mem0//python_jose",
+        "@pypi_mem0//slowapi",
+        "@pypi_mem0//sqlalchemy",
+        "@pypi_mem0//uvicorn",
+    ],
+)
+
+# stdlib `unittest`, NOT pytest. Adding pytest meant a `[dependency-groups]`
+# block in tools/mcp/mem0/server/pyproject.toml, and rules_py's `uv.project`
+# then emitted a hub containing ONLY that group — the `mem0_server` dep group
+# vanished and every `@pypi_mem0//<pkg>` label above failed at analysis. unittest
+# needs nothing in the lock, so the shipped image's dep graph is untouched.
+#
+# `dep_group` for the same reason as the py_binary in
+# @ideaprojects//tools/mcp/mem0/server: the uv hub gates every wheel on
+# `//dep_group:mem0-server`, and without it they resolve to
+# `@platforms//:incompatible`.
+py_test(
+    name = "auth0_test_impl",
+    size = "small",
+    srcs = ["tests/test_auth0.py"],
+    dep_group = "mem0-server",
+    main = "tests/test_auth0.py",
+    tags = ["manual"],
+    # `imports = ["."]` on :server makes the app's modules top-level (`auth0`,
+    # `auth`, ...), so the test imports them exactly as the app does.
+    deps = [":server"],
+)
+
+# The @pypi_mem0 wheels are resolved for linux/glibc (that is what the image
+# ships), and rules_py gates its interpreter and wheel toolchains on
+# `platform_libc`, which the repo-default linux_amd64 platform does not set. So
+# the test has to run under the same platform the image is built for — hence the
+# transition rather than a bare py_test. Runs remotely; it will not run on a
+# macOS exec platform.
+platform_transition_test(
+    name = "auth0_test",
+    binary = ":auth0_test_impl",
+    target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)

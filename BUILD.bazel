@@ -1,0 +1,36 @@
+# Overlay BUILD for the mem0 nested repo (third-party upstream mem0ai/mem0 —
+# ships no Bazel files). Only the FastAPI app under server/ is consumed here;
+# the rest of the upstream tree (the mem0ai SDK, docs, examples, embedchain)
+# comes along with the checkout but is not built.
+#
+# The image itself is assembled in //tools/mcp/mem0/server — this file only
+# exposes the upstream sources as handles for those rules.
+
+filegroup(
+    name = "server_srcs",
+    srcs = glob(
+        ["server/**/*.py"],
+        allow_empty = True,
+    ),
+    visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"],
+)
+
+# Alembic migrations ship in the image and run as the `db-migrate` initContainer
+# (`alembic upgrade head`). Without alembic.ini + versions/ present at /app the
+# server 500s on every request with `relation "request_logs" does not exist`.
+filegroup(
+    name = "server_migrations",
+    srcs = glob(
+        [
+            "server/alembic.ini",
+            "server/alembic/**",
+        ],
+        allow_empty = True,
+    ),
+    visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"],
+)
+
+exports_files(
+    ["server/requirements.txt"],
+    visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"],
+)
