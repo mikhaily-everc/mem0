@@ -15,6 +15,18 @@ load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"])
 
+# requirements.txt is the SOURCE this whole dependency set is transcribed from:
+# @ideaprojects//tools/mcp/mem0/server:pyproject.toml is a hand copy of it, because
+# rules_py's uv resolver needs a pyproject + uv.lock pair and upstream ships neither
+# (its Dockerfile just pip-installs this file). Exported so a test over there can
+# compare the two and fail when the pin here moves out from under the copy.
+#
+# It must be exported HERE, in server/'s own package. The repo-root BUILD carries
+# exports_files(["server/requirements.txt"]), which is dead — this directory is its own
+# package, so the root cannot export a file inside it. That dead export looks exactly
+# like the one you need; do not rely on it.
+exports_files(["requirements.txt"])
+
 py_library(
     name = "server",
     srcs = glob(
