@@ -30,7 +30,10 @@ filegroup(
     visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"],
 )
 
-exports_files(
-    ["server/requirements.txt"],
-    visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"],
-)
+# NOTE: there is deliberately no `exports_files(["server/requirements.txt"])` here.
+# server/ is its own Bazel package, so a root-package export of a file inside it is
+# inert — the label never resolves and nothing can depend on it. One lived here until
+# 2026-07-30 and was actively misleading: it looked exactly like the export
+# //tools/mcp/mem0/server:requirements_in_sync_test needs, which is why that test
+# appeared to be already wired when it was not. The live export is in
+# server/BUILD.bazel.

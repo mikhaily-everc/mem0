@@ -33,8 +33,12 @@ py_library(
         ["**/*.py"],
         allow_empty = False,
         exclude = [
-            # Upstream's Streamlit operator UI. Not served by the API container
-            # and pulls streamlit, which is deliberately absent from uv.lock.
+            # Upstream's operator UI — a Next.js 15 app (dashboard/package.json is
+            # `mem0-dashboard`, next 15.5.18 + react 19), NOT the Streamlit UI an
+            # earlier revision of this comment claimed. It holds no Python at all, so
+            # this glob would skip it regardless; the exclusion is here to say so
+            # deliberately rather than by accident. It is not deployed — see
+            # @ideaprojects//tools/mcp/mem0:CLAUDE.md for the scope decision.
             "dashboard/**",
             # Tests are their own target below. Excluded here so they stay out of
             # the py_binary closure and therefore out of the shipped image.
