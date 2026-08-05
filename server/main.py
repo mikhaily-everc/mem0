@@ -147,6 +147,24 @@ EMBEDDING_DIMS = int(_EMBEDDING_DIMS_ENV) if _EMBEDDING_DIMS_ENV else None
 # valid (max_size stays at the maxconn default 5); idle connections then drain after the
 # pool's max_idle (600s), letting the cluster pause.
 PG_MINCONN = int(os.environ.get("MEM0_PG_MINCONN", "1"))
+# evercompliant POC patch: the LIBRARY already accepts `reasoning_effort` and
+# `is_reasoning_model` (mem0/configs/llms/base.py), but the server never passed either, so a
+# deployment had no way to set them. That gap is load-bearing for any thinking-capable
+# extraction model, because `LLMBase._is_reasoning_model` classifies by NAME against a set of
+# OpenAI ids only ({o1, o3, gpt-5, ...}): `gemini-3.5-flash` misses it, is treated as a regular
+# model, and so is sent `max_tokens` — which its reasoning tokens consume before it emits the
+# fact JSON (measured through bifrost: 866 reasoning vs 202 text tokens on a 2KB input). The
+# JSON arrives truncated, extraction logs "Error parsing extraction response: Unterminated
+# string", and POST /memories STILL returns 200 with an empty results list — so total
+# extraction failure is indistinguishable from "no new facts found" at the API.
+#
+# MEM0_LLM_IS_REASONING_MODEL=true takes precedence over that heuristic and drops max_tokens
+# (and temperature) entirely; MEM0_LLM_REASONING_EFFORT=none additionally stops the thinking
+# tokens being spent at all (verified via bifrost -> vertex: reasoning tokens go to 0,
+# finish_reason=stop). Both default to None, i.e. unchanged upstream behaviour.
+LLM_REASONING_EFFORT = os.environ.get("MEM0_LLM_REASONING_EFFORT") or None
+_IS_REASONING_ENV = os.environ.get("MEM0_LLM_IS_REASONING_MODEL")
+LLM_IS_REASONING_MODEL = _IS_REASONING_ENV.strip().lower() == "true" if _IS_REASONING_ENV else None
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -165,7 +183,13 @@ DEFAULT_CONFIG = {
     },
     "llm": {
         "provider": "openai",
-        "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
+        "config": {
+            "api_key": OPENAI_API_KEY,
+            "temperature": 0.2,
+            "model": DEFAULT_LLM_MODEL,
+            **({"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}),
+            **({"is_reasoning_model": LLM_IS_REASONING_MODEL} if LLM_IS_REASONING_MODEL is not None else {}),
+        },
     },
     "embedder": {
         "provider": "openai",
@@ -435,7 +459,16 @@ def add_memory(memory_create: MemoryCreate, scope: MemoryScope = Depends(resolve
 
 
 ALL_MEMORIES_LIMIT = 1000
-_RESERVED_PAYLOAD_KEYS = {"data", "user_id", "agent_id", "run_id", "hash", "created_at", "updated_at", "expiration_date"}
+_RESERVED_PAYLOAD_KEYS = {
+    "data",
+    "user_id",
+    "agent_id",
+    "run_id",
+    "hash",
+    "created_at",
+    "updated_at",
+    "expiration_date",
+}
 
 
 def _serialize_memory(row: Any) -> Dict[str, Any]:
