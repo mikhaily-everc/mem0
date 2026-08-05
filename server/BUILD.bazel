@@ -146,3 +146,25 @@ platform_transition_test(
     binary = ":bedrock_embedder_test_impl",
     target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
 )
+
+# Guards a SILENT defect: the library's AWSBedrockLLM.generate_response accepts
+# `response_format` and never references it, so requesting JSON is a no-op that raises nothing
+# and degrades into mem0 reporting "no new facts found". These assert on the REQUEST reaching
+# Bedrock, not just on the return type — a test that only checked "returns a string" would pass
+# against the broken version. Also pins the model-support gate, which is NOT newest-first:
+# output_config works on 4.6-and-older and is rejected by Opus 4.8 / Opus 5 / Sonnet 5.
+py_test(
+    name = "bedrock_llm_test_impl",
+    size = "small",
+    srcs = ["tests/test_bedrock_llm.py"],
+    dep_group = "mem0-server",
+    main = "tests/test_bedrock_llm.py",
+    tags = ["manual"],
+    deps = [":server"],
+)
+
+platform_transition_test(
+    name = "bedrock_llm_test",
+    binary = ":bedrock_llm_test_impl",
+    target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)

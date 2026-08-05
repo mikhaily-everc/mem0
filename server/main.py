@@ -28,6 +28,7 @@ from errors import (
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from llms import install_overrides as install_llm_overrides
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from models import RequestLog, User
 from pydantic import BaseModel, Field
@@ -81,7 +82,12 @@ SKIPPED_REQUEST_LOG_PREFIXES = ("/requests",)
 # in ai-utils' tools/mcp/mem0/server/pyproject.toml, which transcribes that file,
 # and re-running `aspect run //tools/mcp/mem0/server:lock`. Prefer pointing
 # bifrost at the model instead — that is the whole reason it is in front.
-BUNDLED_LLM_PROVIDERS = ("openai",)
+# aws_bedrock is bundled for the LLM too (boto3 is already in the image for the embedder). It
+# is the only way to get grammar-constrained extraction: bifrost CAN carry a strict schema
+# (`response_format: {type: json_schema}` -> Gemini `responseJsonSchema`), but mem0 hardcodes
+# the weak `{"type": "json_object"}` form in the LIBRARY, which ships from PyPI and cannot be
+# patched from this fork. See MEM0_LLM_PROVIDER below.
+BUNDLED_LLM_PROVIDERS = ("openai", "aws_bedrock")
 # aws_bedrock is bundled for the EMBEDDER only (boto3 in server/requirements.txt). It is the
 # one path bifrost cannot serve: its virtual key is not authorised for cohere, and its
 # OpenAI-compatible surface carries no input_type, so an asymmetric embedder is reduced to a
@@ -198,6 +204,26 @@ LLM_TEMPERATURE = float(_TEMPERATURE_ENV) if _TEMPERATURE_ENV else None
 EMBEDDER_PROVIDER = os.environ.get("MEM0_EMBEDDER_PROVIDER", "openai").strip() or "openai"
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
+# MEM0_LLM_PROVIDER=aws_bedrock switches fact extraction from bifrost to a direct Bedrock
+# client. The reason to want that is GRAMMAR-CONSTRAINED output: mem0 asks for JSON with
+# `response_format={"type": "json_object"}`, which is a request, not a guarantee — measured on
+# this corpus it returns unparseable JSON on ~19% of real inputs, and every failure is SILENT
+# (`POST /memories` answers 200 with `{"results": []}`, byte-identical to "no new facts").
+# Bedrock's `output_config.format` compiles the schema into a grammar, which removes that
+# failure class outright.
+#
+# Model support is narrow and NOT newest-first — see server/llms/aws_bedrock.py. Only
+# 4.6-and-older Claude accepts it; Opus 4.8 / Opus 5 / Sonnet 5 reject it on every AWS surface,
+# so choosing a "better" model silently degrades to prompt-only JSON.
+#
+# Needs the same pod AWS credentials as the embedder (Otterize aws: ClientIntents). Unlike the
+# embedder, a failure here is a degradation rather than an outage: extraction only runs on
+# `infer:true` writes, and this corpus is imported with `infer:false`.
+LLM_PROVIDER = os.environ.get("MEM0_LLM_PROVIDER", "openai").strip() or "openai"
+
+_LLM_MAX_TOKENS_ENV = os.environ.get("MEM0_LLM_MAX_TOKENS", "").strip()
+LLM_MAX_TOKENS = int(_LLM_MAX_TOKENS_ENV) if _LLM_MAX_TOKENS_ENV else None
+
 # Point "aws_bedrock" at embedders/aws_bedrock.py instead of the wheel's own version.
 #
 # This is NOT belt-and-braces over the fix in mem0/embeddings/aws_bedrock.py — it is the
@@ -212,6 +238,13 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # and imports nothing until that provider is selected, so gating would only add a way for
 # the two to disagree.
 install_embedder_overrides()
+
+# Point "aws_bedrock" at server/llms/aws_bedrock.py. The library's AWSBedrockLLM accepts a
+# `response_format` argument and then never references it, so asking mem0's Bedrock provider for
+# JSON is a silent no-op — the override is what makes MEM0_LLM_PROVIDER=aws_bedrock actually
+# enforce a schema. Unconditional for the same reason as the embedder: it rebinds one entry in a
+# lookup table and imports nothing until that provider is selected.
+install_llm_overrides()
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -229,13 +262,32 @@ DEFAULT_CONFIG = {
         },
     },
     "llm": {
-        "provider": "openai",
+        "provider": LLM_PROVIDER,
         "config": {
-            "api_key": OPENAI_API_KEY,
+            # api_key is bifrost's virtual key; a direct Bedrock client authenticates with the
+            # pod's IAM role instead, and AWSBedrockConfig has no api_key field at all.
+            **({"api_key": OPENAI_API_KEY} if LLM_PROVIDER == "openai" else {}),
+            **({"aws_region": AWS_REGION} if LLM_PROVIDER == "aws_bedrock" else {}),
             **({"temperature": LLM_TEMPERATURE} if LLM_TEMPERATURE is not None else {}),
             "model": DEFAULT_LLM_MODEL,
-            **({"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}),
-            **({"is_reasoning_model": LLM_IS_REASONING_MODEL} if LLM_IS_REASONING_MODEL is not None else {}),
+            # Bedrock's Converse path defaults maxTokens to 2000, which truncates extraction on
+            # a large input (measured: up to 21 facts from one 5KB file). Pass it explicitly.
+            **({"max_tokens": LLM_MAX_TOKENS} if LLM_MAX_TOKENS else {}),
+            # Reasoning knobs are OpenAI-shaped and exist for the bifrost/gemini path only.
+            # AWSBedrockConfig has no such fields, and the factory calls config_class(**config)
+            # directly for a dict config, so passing them would raise TypeError at startup.
+            **(
+                {
+                    **({"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}),
+                    **(
+                        {"is_reasoning_model": LLM_IS_REASONING_MODEL}
+                        if LLM_IS_REASONING_MODEL is not None
+                        else {}
+                    ),
+                }
+                if LLM_PROVIDER == "openai"
+                else {}
+            ),
         },
     },
     "embedder": {
