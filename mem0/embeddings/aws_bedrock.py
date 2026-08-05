@@ -57,7 +57,7 @@ class AWSBedrockEmbedding(EmbeddingBase):
         norm_emb = emb / np.linalg.norm(emb)
         return norm_emb.tolist()
 
-    def _get_embedding(self, text):
+    def _get_embedding(self, text, memory_action=None):
         """Call out to Bedrock embedding endpoint."""
 
         # Format input body based on the provider
@@ -65,8 +65,19 @@ class AWSBedrockEmbedding(EmbeddingBase):
         input_body = {}
 
         if provider == "cohere":
-            input_body["input_type"] = "search_document"
+            # Cohere is an ASYMMETRIC embedder: it builds a different vector for a short
+            # question than for the long document that answers it, and retrieval quality
+            # depends on telling it which one this is. Hardcoding search_document (as upstream
+            # does) embeds queries as if they were documents, which discards the single
+            # advantage Cohere has over a symmetric model like Titan.
+            input_body["input_type"] = "search_query" if memory_action == "search" else "search_document"
             input_body["texts"] = [text]
+            # embed-v4 defaults to 1536 dimensions and accepts 256/512/1024/1536. The pgvector
+            # column width is fixed at table creation, so a mismatch is not a degradation, it
+            # is a hard insert failure. v3 has no such parameter (fixed 1024) and rejects it.
+            if self.config.embedding_dims is not None and "v4" in self.config.model:
+                input_body["output_dimension"] = self.config.embedding_dims
+                input_body["embedding_types"] = ["float"]
         else:
             # Amazon and other providers
             input_body["inputText"] = text
@@ -89,7 +100,16 @@ class AWSBedrockEmbedding(EmbeddingBase):
             response_body = json.loads(response.get("body").read())
 
             if provider == "cohere":
-                embeddings = response_body.get("embeddings")[0]
+                embeddings = response_body.get("embeddings")
+                # v3 answers {"embeddings": [[...]]}; v4 answers
+                # {"embeddings": {"float": [[...]]}} keyed by embedding_types. Indexing [0]
+                # on the v4 shape reads a dict key, not a vector.
+                if isinstance(embeddings, dict):
+                    vectors = embeddings.get("float") or next(iter(embeddings.values()), None)
+                    if not vectors:
+                        raise ValueError(f"no embedding vectors in response keys {list(embeddings)}")
+                    embeddings = vectors
+                embeddings = embeddings[0]
             else:
                 embeddings = response_body.get("embedding")
 
@@ -107,4 +127,6 @@ class AWSBedrockEmbedding(EmbeddingBase):
         Returns:
             list: The embedding vector.
         """
-        return self._get_embedding(text)
+        # Forwarded, not dropped: for asymmetric models (Cohere) this selects search_query vs
+        # search_document, which is the whole point of the parameter.
+        return self._get_embedding(text, memory_action=memory_action)

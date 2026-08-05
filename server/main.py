@@ -81,7 +81,11 @@ SKIPPED_REQUEST_LOG_PREFIXES = ("/requests",)
 # and re-running `aspect run //tools/mcp/mem0/server:lock`. Prefer pointing
 # bifrost at the model instead — that is the whole reason it is in front.
 BUNDLED_LLM_PROVIDERS = ("openai",)
-BUNDLED_EMBEDDER_PROVIDERS = ("openai",)
+# aws_bedrock is bundled for the EMBEDDER only (boto3 in server/requirements.txt). It is the
+# one path bifrost cannot serve: its virtual key is not authorised for cohere, and its
+# OpenAI-compatible surface carries no input_type, so an asymmetric embedder is reduced to a
+# symmetric one. Requires AWS credentials in the pod — see MEM0_EMBEDDER_PROVIDER below.
+BUNDLED_EMBEDDER_PROVIDERS = ("openai", "aws_bedrock")
 
 
 def _warn_if_unconfigured() -> None:
@@ -178,6 +182,21 @@ LLM_IS_REASONING_MODEL = _IS_REASONING_ENV.strip().lower() == "true" if _IS_REAS
 _TEMPERATURE_ENV = os.environ.get("MEM0_LLM_TEMPERATURE", "0.2").strip()
 LLM_TEMPERATURE = float(_TEMPERATURE_ENV) if _TEMPERATURE_ENV else None
 
+# evercompliant POC patch: the embedder provider is pinned to "openai" upstream, which here
+# means bifrost via OPENAI_BASE_URL. That is the right default — bifrost holds the credentials
+# and this pod has none — but it cannot reach models bifrost's virtual key is not authorised
+# for (cohere returns 502 provider_auth_failed), and it flattens the query/document asymmetry
+# that asymmetric embedders depend on.
+#
+# MEM0_EMBEDDER_PROVIDER=aws_bedrock switches to a direct Bedrock client. That requires AWS
+# credentials IN THIS POD, which arrive via Otterize: an aws: target on the workload's
+# ClientIntents makes the credentials-operator mint an IAM role and annotate the
+# ServiceAccount. Without that intent applied first, this setting makes every embed call fail
+# — and since embedding happens on add AND on search, that is a total outage of the store,
+# not a degradation.
+EMBEDDER_PROVIDER = os.environ.get("MEM0_EMBEDDER_PROVIDER", "openai").strip() or "openai"
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
@@ -204,9 +223,12 @@ DEFAULT_CONFIG = {
         },
     },
     "embedder": {
-        "provider": "openai",
+        "provider": EMBEDDER_PROVIDER,
         "config": {
-            "api_key": OPENAI_API_KEY,
+            # api_key is bifrost's virtual key and is meaningless to a direct Bedrock client,
+            # which authenticates with the pod's IAM role instead.
+            **({"api_key": OPENAI_API_KEY} if EMBEDDER_PROVIDER == "openai" else {}),
+            **({"aws_region": AWS_REGION} if EMBEDDER_PROVIDER == "aws_bedrock" else {}),
             "model": DEFAULT_EMBEDDER_MODEL,
             **({"embedding_dims": EMBEDDING_DIMS} if EMBEDDING_DIMS else {}),
         },
