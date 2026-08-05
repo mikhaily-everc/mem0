@@ -12,6 +12,7 @@ import cleanly on a developer's machine and fail only inside the container.
 
 load("@bazel_lib//lib:transitions.bzl", "platform_transition_test")
 load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
+load("@pypi_mem0//:defs.bzl", "group_deps_for")
 
 package(default_visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"])
 
@@ -53,30 +54,43 @@ py_library(
         allow_empty = False,
     ),
     imports = ["."],
-    deps = [
-        "@pypi_mem0//alembic",
-        "@pypi_mem0//bcrypt",
-        "@pypi_mem0//cryptography",
-        "@pypi_mem0//fastapi",
-        # No anthropic, no google_generativeai: BUNDLED_*_PROVIDERS in
-        # server/main.py is ("openai",) alone, because every model is served
-        # through bifrost's OpenAI-compatible API.
-        # Auth0 JWKS fetch in server/auth0.py. Already in the resolved graph via
-        # openai/qdrant-client, but this deps list is explicit, so a transitive
-        # presence is not enough to import it.
-        "@pypi_mem0//httpx",
-        "@pypi_mem0//mem0ai",
-        "@pypi_mem0//passlib",
-        "@pypi_mem0//posthog",
-        "@pypi_mem0//psycopg",
-        "@pypi_mem0//psycopg_pool",
-        "@pypi_mem0//pydantic",
-        "@pypi_mem0//python_dotenv",
-        "@pypi_mem0//python_jose",
-        "@pypi_mem0//slowapi",
-        "@pypi_mem0//sqlalchemy",
-        "@pypi_mem0//uvicorn",
-    ],
+    # The whole `mem0-server` dependency group, i.e. every package uv.lock resolved for it —
+    # NOT a hand-written label list. This was a hand-written list of 16
+    # `@pypi_mem0//<pkg>` labels, and that is what broke the Bedrock embedder: on 2026-08-05
+    # `MEM0_EMBEDDER_PROVIDER=aws_bedrock` CrashLoopBackOff'd on `import boto3`, with boto3
+    # DECLARED in @ideaprojects//tools/mcp/mem0/server:pyproject.toml, resolved into uv.lock,
+    # passing :requirements_in_sync_test — and simply never installed, because no target
+    # depended on it. It presents exactly like a stale lock or a stale module extension and is
+    # neither, which is why it cost a day.
+    #
+    # Being in the lock is NECESSARY BUT NOT SUFFICIENT. `uv.declare_hub` only makes the
+    # `@pypi_mem0//<pkg>` labels available; rules_py installs a wheel into the venv when
+    # something in the closure DEPENDS on it. A fourth copy of the dependency set living here
+    # meant `pip install -r requirements.txt` and this image could disagree, silently, in the
+    # direction of a missing module at runtime.
+    #
+    # So the set is now stated ONCE. pyproject.toml is the source of truth,
+    # :requirements_in_sync_test pins it to the fork's requirements.txt, and the venv is
+    # whatever that resolves to — the same semantics as upstream's `pip install -r`. Adding a
+    # dependency is now: edit pyproject.toml, `aspect run //tools/mcp/mem0/server:lock`, done.
+    #
+    # The cost, accepted deliberately: no per-target dependency strictness. Any module under
+    # server/ can import any locked package without declaring it. That is the right trade for
+    # a dependency set that exists to describe ONE image and is already governed by a test;
+    # the strictness was buying nothing here and cost an outage.
+    #
+    # `group_deps_for("mem0-server")`, NOT the `group_deps()` that follows the consuming
+    # target's group. Both read the same table; `group_deps()` returns a `select()` over
+    # `@pypi_mem0//dep_group:*`, and a py_library cannot set `dep_group` — that attribute only
+    # exists on py_binary/py_test/py_venv, where it is a transition. So under `group_deps()`
+    # this target stops analyzing on its own (`configurable attribute "deps" ... doesn't match
+    # this configuration`) and takes any wildcard containing it down with it. There is exactly
+    # one group here, so following the consumer's choice buys nothing anyway.
+    #
+    # The returned labels are still hub ALIASES resolved under the active `dep_group`, so
+    # consumers must set `dep_group = "mem0-server"` regardless — the py_binary in
+    # @ideaprojects//tools/mcp/mem0/server and both py_tests below do.
+    deps = group_deps_for("mem0-server"),
 )
 
 # stdlib `unittest`, NOT pytest. Adding pytest meant a `[dependency-groups]`
@@ -110,5 +124,25 @@ py_test(
 platform_transition_test(
     name = "auth0_test",
     binary = ":auth0_test_impl",
+    target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)
+
+# Doubles as the boto3 canary. Every other check on that dependency (pyproject, uv.lock, the
+# requirements-in-sync test) looks at a DECLARATION; this one imports it, so it goes red on
+# exactly the failure that put the pod in CrashLoopBackOff — the wheel resolved but never
+# installed because no target depended on it.
+py_test(
+    name = "bedrock_embedder_test_impl",
+    size = "small",
+    srcs = ["tests/test_bedrock_embedder.py"],
+    dep_group = "mem0-server",
+    main = "tests/test_bedrock_embedder.py",
+    tags = ["manual"],
+    deps = [":server"],
+)
+
+platform_transition_test(
+    name = "bedrock_embedder_test",
+    binary = ":bedrock_embedder_test_impl",
     target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
 )

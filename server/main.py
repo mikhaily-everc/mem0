@@ -16,6 +16,7 @@ from auth import (
 )
 from db import SessionLocal
 from dotenv import load_dotenv
+from embedders import install_overrides as install_embedder_overrides
 from errors import (
     UpstreamError,
     install_request_id_logging,
@@ -196,6 +197,21 @@ LLM_TEMPERATURE = float(_TEMPERATURE_ENV) if _TEMPERATURE_ENV else None
 # not a degradation.
 EMBEDDER_PROVIDER = os.environ.get("MEM0_EMBEDDER_PROVIDER", "openai").strip() or "openai"
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Point "aws_bedrock" at embedders/aws_bedrock.py instead of the wheel's own version.
+#
+# This is NOT belt-and-braces over the fix in mem0/embeddings/aws_bedrock.py — it is the
+# only copy that runs. The image installs mem0ai from PyPI (upstream's own production
+# Dockerfile does the same; only dev.Dockerfile pip-installs the local library), so this
+# repo's mem0/ is an upstream contribution that reaches the server no sooner than the next
+# PyPI release. Stock Bedrock+Cohere cannot serve embed-v4 at all: it hardcodes
+# input_type=search_document, never sends output_dimension (1536 dims into a fixed 1024
+# pgvector column), and indexes [0] into v4's dict-shaped response.
+#
+# Unconditional, not gated on EMBEDDER_PROVIDER: it rebinds one entry in a lookup table
+# and imports nothing until that provider is selected, so gating would only add a way for
+# the two to disagree.
+install_embedder_overrides()
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
