@@ -166,6 +166,18 @@ LLM_REASONING_EFFORT = os.environ.get("MEM0_LLM_REASONING_EFFORT") or None
 _IS_REASONING_ENV = os.environ.get("MEM0_LLM_IS_REASONING_MODEL")
 LLM_IS_REASONING_MODEL = _IS_REASONING_ENV.strip().lower() == "true" if _IS_REASONING_ENV else None
 
+# evercompliant POC patch: `temperature` must be OMITTABLE, not merely settable. Newer models
+# reject the parameter outright rather than ignoring it — claude-sonnet-5 on Bedrock answers
+# HTTP 400 `The model returned the following errors: `temperature` is deprecated for this
+# model.` So a hardcoded temperature does not degrade on such a model, it makes the model
+# entirely unreachable: every extraction call fails, and mem0 surfaces that as 200 with an
+# empty results list, i.e. silently storing nothing.
+#
+# Set MEM0_LLM_TEMPERATURE to a float to pin it, or to the empty string to omit the key
+# altogether. Default "0.2" preserves the previous behaviour exactly.
+_TEMPERATURE_ENV = os.environ.get("MEM0_LLM_TEMPERATURE", "0.2").strip()
+LLM_TEMPERATURE = float(_TEMPERATURE_ENV) if _TEMPERATURE_ENV else None
+
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
@@ -185,7 +197,7 @@ DEFAULT_CONFIG = {
         "provider": "openai",
         "config": {
             "api_key": OPENAI_API_KEY,
-            "temperature": 0.2,
+            **({"temperature": LLM_TEMPERATURE} if LLM_TEMPERATURE is not None else {}),
             "model": DEFAULT_LLM_MODEL,
             **({"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}),
             **({"is_reasoning_model": LLM_IS_REASONING_MODEL} if LLM_IS_REASONING_MODEL is not None else {}),
