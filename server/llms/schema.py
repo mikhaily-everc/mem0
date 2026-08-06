@@ -26,9 +26,28 @@ class FactExtraction(BaseModel):
     facts: list[str]
 
 
+def _strip_prose(node: Any) -> Any:
+    """Remove `description`/`title` from a generated schema, recursively.
+
+    Pydantic puts the model's DOCSTRING into the schema as `description` and every field name
+    into `title`. Both then ride on the wire with every single extraction request — the
+    docstring above is ~400 characters of internal commentary that the provider neither needs
+    nor benefits from, and it was observed verbatim in bifrost's echoed `raw_request`.
+
+    Stripped rather than avoided by shortening the docstring, so the explanation can stay where
+    a reader will find it. Neither key carries meaning for constrained decoding: the grammar is
+    built from types, `required` and `additionalProperties`.
+    """
+    if isinstance(node, dict):
+        return {k: _strip_prose(v) for k, v in node.items() if k not in ("description", "title")}
+    if isinstance(node, list):
+        return [_strip_prose(v) for v in node]
+    return node
+
+
 # Resolved once at import. The grammar is compiled and cached per-schema on the provider side,
 # so these bytes must be stable across requests or every call pays first-compile latency.
-FACTS_SCHEMA: Dict[str, Any] = FactExtraction.model_json_schema()
+FACTS_SCHEMA: Dict[str, Any] = _strip_prose(FactExtraction.model_json_schema())
 
 # OpenAI-compatible strict form. `strict: true` is what turns Azure's json_schema mode into
 # constrained decoding; bifrost forwards it, and for Gemini it drops the flag and translates

@@ -161,6 +161,29 @@ class SharedShapeTest(unittest.TestCase):
 
         self.assertIs(BEDROCK_SCHEMA, FACTS_SCHEMA)
 
+    def test_no_prose_rides_on_the_wire(self) -> None:
+        """Pydantic puts the model DOCSTRING into `description` and field names into `title`,
+        and the schema is sent with every extraction request. This was observed verbatim in
+        bifrost's echoed raw_request — ~400 characters of internal commentary per call. Neither
+        key affects constrained decoding, so both are stripped."""
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    self.assertNotIn(key, ("description", "title"))
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(FACTS_SCHEMA)
+
+    def test_stripping_left_the_load_bearing_keys(self) -> None:
+        """The strip must not take the two keys the providers actually require."""
+        self.assertFalse(FACTS_SCHEMA["additionalProperties"])
+        self.assertEqual(FACTS_SCHEMA["required"], ["facts"])
+        self.assertEqual(FACTS_SCHEMA["properties"]["facts"]["type"], "array")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
