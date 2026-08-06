@@ -68,6 +68,12 @@ class ExtractedMemory(BaseModel):
 
     id: str
     text: str
+    # NOT `Literal["user", "assistant"]`, however much it looks like it should be. A Literal
+    # becomes an `enum` in the wire schema, i.e. a hard grammar constraint, and the prompt asks
+    # for a THIRD case: "in multi-speaker conversations the 'assistant' role may represent a real
+    # person sharing their own life ... attributed to the speaker by name". Narrowing this makes
+    # a speaker's name unrepresentable — the model would be instructed to emit it and forbidden
+    # from doing so, and the fallback is mis-attributing that memory to "assistant".
     attributed_to: str
     linked_memory_ids: list[str]
 
