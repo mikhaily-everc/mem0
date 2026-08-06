@@ -168,3 +168,23 @@ platform_transition_test(
     binary = ":bedrock_llm_test_impl",
     target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
 )
+
+# The OpenAI-compatible half. Guards a ONE-WORD difference with a huge behavioural gap:
+# `json_object` (what mem0 sends) is a polite request that silently fails to parse on ~19% of
+# real inputs, while `json_schema` + `strict` is grammar-constrained. Nothing raises when the
+# weak form is used, so these assert on the request handed to the parent class.
+py_test(
+    name = "openai_schema_test_impl",
+    size = "small",
+    srcs = ["tests/test_openai_schema.py"],
+    dep_group = "mem0-server",
+    main = "tests/test_openai_schema.py",
+    tags = ["manual"],
+    deps = [":server"],
+)
+
+platform_transition_test(
+    name = "openai_schema_test",
+    binary = ":openai_schema_test_impl",
+    target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)

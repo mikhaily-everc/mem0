@@ -28,36 +28,13 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+from llms.schema import FACTS_SCHEMA, FactExtraction
 from mem0.llms.aws_bedrock import AWSBedrockLLM
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
-
-class FactExtraction(BaseModel):
-    """The single shape mem0 ever asks for.
-
-    Both call sites that pass `response_format` (mem0/memory/main.py, sync fact extraction and
-    its async twin) expect exactly `{"facts": [str]}`. The memory-UPDATE path passes no
-    `response_format` at all, so it never reaches this schema — there is no second shape to
-    select between.
-
-    A Pydantic model rather than a hand-written dict so the shape is declared once and stays
-    checkable in Python. `extra="forbid"` is NOT stylistic: it is what makes
-    `model_json_schema()` emit `additionalProperties: false`, which Bedrock REQUIRES on every
-    object. Without it the schema is rejected at grammar-compile time with a 400 that reads
-    like a schema-validity complaint rather than a missing-keyword one. `facts` is non-optional,
-    which is what puts it in `required` — Bedrock's other hard requirement.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    facts: list[str]
-
-
-# Resolved once at import: the grammar is compiled and cached server-side per schema, so the
-# bytes must be stable across requests or every call pays first-compile latency.
-FACTS_SCHEMA: Dict[str, Any] = FactExtraction.model_json_schema()
+__all__ = ["ConstrainedAWSBedrockLLM", "FACTS_SCHEMA", "FactExtraction"]
 
 # Substrings, not exact ids, because the deployed id carries an inference-profile prefix and a
 # version suffix (e.g. `us.anthropic.claude-haiku-4-5-20251001-v1:0`).
