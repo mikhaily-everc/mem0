@@ -56,6 +56,7 @@ every extraction. Pydantic emits a `$ref` for any nested model, so `_inline_refs
 back out — see there.
 """
 
+import logging
 from typing import Any, Dict, FrozenSet
 
 from pydantic import BaseModel, ConfigDict
@@ -85,6 +86,27 @@ class MemoryExtraction(BaseModel):
 
     memory: list[ExtractedMemory]
 
+    def blank_text_ids(self) -> list[str]:
+        """Ids of memories mem0 will discard in COMPLETE silence.
+
+        `mem0/memory/main.py`: `if not text or text not in embed_map: continue` — no log at any
+        level. A model that emits an object with an empty or whitespace `text` therefore costs a
+        row with no trace, and the count of stored memories comes out lower than the count the
+        model produced with nothing to explain the gap.
+        """
+        return [m.id for m in self.memory if not m.text.strip()]
+
+    def duplicate_text_count(self) -> int:
+        """How many memories mem0 will drop as md5 duplicates OF EACH OTHER.
+
+        Within this batch only. mem0 also dedups against the hashes of already-stored rows, and
+        those are not visible from here, so the real drop count is >= this. Expected behaviour
+        rather than a defect — but it is logged at DEBUG upstream, so at INFO the difference
+        between "the model repeated itself" and "extraction under-produced" is invisible.
+        """
+        texts = [m.text.strip() for m in self.memory if m.text.strip()]
+        return len(texts) - len(set(texts))
+
 
 class ParsedJson(str):
     """A JSON string that also carries its validated model.
@@ -106,6 +128,48 @@ class ParsedJson(str):
         obj = super().__new__(cls, raw)
         obj.parsed = parsed
         return obj
+
+
+def log_extraction(parsed: MemoryExtraction, logger: logging.Logger) -> None:
+    """Say out loud what extraction produced. The ONE production consumer of `ParsedJson.parsed`.
+
+    This exists because the defect this module was rewritten to fix was invisible for as long as
+    it was, and invisibility was the whole problem: the grammar emitted `facts`, mem0 read
+    `memory`, and the only externally observable symptom was `POST /memories` answering 200 with
+    an empty results list — identical to "there was nothing worth extracting". Nothing raised and
+    nothing logged, at any level, anywhere.
+
+    So the count is emitted here, on the one code path that can see the model's own output
+    BEFORE mem0 filters it. `tools/mcp/mem0/CLAUDE.md` documents the diagnostic as
+    `kubectl logs deploy/mlrc-mem0-server | grep -i 'extraction'`; these lines are written to be
+    found by exactly that grep.
+
+    Reading it off `.parsed` rather than re-parsing the string is the point of `ParsedJson`:
+    validation has already happened and must happen regardless, so the typed object is free.
+    """
+    total = len(parsed.memory)
+    blank = parsed.blank_text_ids()
+    duplicates = parsed.duplicate_text_count()
+
+    logger.info(
+        "extraction produced %d memories (%d blank, %d duplicate-in-batch)",
+        total,
+        len(blank),
+        duplicates,
+    )
+
+    # A warning rather than part of the line above: unlike deduplication, this is not normal.
+    # The model was asked for a self-contained 15-80 word statement and returned an object with
+    # no text in it, and mem0 discards those without a word — so this is the only place the loss
+    # is ever attributable.
+    if blank:
+        logger.warning(
+            "extraction returned %d of %d memories with empty text (ids %s); mem0 discards these "
+            "silently, so the stored count will be lower than the extracted count",
+            len(blank),
+            total,
+            ", ".join(blank[:10]),
+        )
 
 
 def _strip_prose(node: Any) -> Any:

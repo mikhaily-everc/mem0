@@ -40,7 +40,12 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from llms.schema import OPENAI_STRICT_RESPONSE_FORMAT, MemoryExtraction, ParsedJson
+from llms.schema import (
+    OPENAI_STRICT_RESPONSE_FORMAT,
+    MemoryExtraction,
+    ParsedJson,
+    log_extraction,
+)
 from mem0.llms.openai import OpenAILLM
 from pydantic import ValidationError
 
@@ -111,6 +116,10 @@ class SchemaEnforcingOpenAILLM(OpenAILLM):
                 "json_schema request. Likely either the backend ignored `strict` or the "
                 f"response was truncated at max_tokens. First 200 chars: {preview!r}"
             ) from exc
+
+        # The one place the model's own output is visible before mem0 filters it — see
+        # log_extraction. This is what makes a silent under-produce attributable.
+        log_extraction(parsed, logger)
 
         # A str subclass carrying the parsed model, NOT a bare BaseModel: mem0's caller runs
         # remove_code_blocks() and json.loads() on this value. It also keeps the original bytes

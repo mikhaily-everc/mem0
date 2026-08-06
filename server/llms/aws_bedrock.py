@@ -28,7 +28,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-from llms.schema import MEMORY_SCHEMA, MemoryExtraction, ParsedJson
+from llms.schema import MEMORY_SCHEMA, MemoryExtraction, ParsedJson, log_extraction
 from mem0.llms.aws_bedrock import AWSBedrockLLM
 from pydantic import ValidationError
 
@@ -156,6 +156,10 @@ class ConstrainedAWSBedrockLLM(AWSBedrockLLM):
                 f"Bedrock returned output that does not match the extraction schema despite "
                 f"grammar constraint (stopReason={stop_reason!r}): {exc}"
             ) from exc
+
+        # The one place the model's own output is visible before mem0 filters it — see
+        # log_extraction. This is what makes a silent under-produce attributable.
+        log_extraction(parsed, logger)
 
         # A str subclass carrying the parsed model, NOT a bare BaseModel: mem0 does its own
         # remove_code_blocks/json.loads on this value. It also keeps the original bytes rather

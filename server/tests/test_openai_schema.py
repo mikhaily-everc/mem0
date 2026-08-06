@@ -240,6 +240,67 @@ class ParsedJsonTest(unittest.TestCase):
         self.assertNotIsInstance(result, ParsedJson)
 
 
+class ExtractionIsLoggedTest(unittest.TestCase):
+    """`.parsed` has exactly one production consumer, and this is it.
+
+    The defect this module was rewritten for survived because nothing anywhere said how many
+    memories extraction produced — the only symptom was a 200 with an empty results list, which
+    is what "nothing worth extracting" looks like too. These pin the line that closes that.
+    """
+
+    def test_the_count_is_logged(self) -> None:
+        with self.assertLogs("llms.openai_schema", level="INFO") as logged:
+            _call(_llm(), returns=_payload("one", "two"), response_format=WEAK)
+        self.assertTrue(any("extraction produced 2 memories" in m for m in logged.output), logged.output)
+
+    def test_the_line_is_findable_by_the_documented_grep(self) -> None:
+        """tools/mcp/mem0/CLAUDE.md tells an operator to run
+        `kubectl logs deploy/mlrc-mem0-server | grep -i 'extraction'`. If the word is not in the
+        line, the runbook silently returns nothing on a healthy server as well as a broken one."""
+        with self.assertLogs("llms.openai_schema", level="INFO") as logged:
+            _call(_llm(), response_format=WEAK)
+        self.assertTrue(any("extraction" in m.lower() for m in logged.output), logged.output)
+
+    def test_blank_text_warns_because_mem0_drops_it_in_silence(self) -> None:
+        """mem0: `if not text or text not in embed_map: continue` — no log at any level. Without
+        this warning the stored count is simply lower than the extracted count, with nothing to
+        attribute the gap to. tests/test_extraction_schema.py pins that library behaviour."""
+        payload = json.dumps(
+            {
+                "memory": [
+                    {"id": "0", "text": "real", "attributed_to": "user", "linked_memory_ids": []},
+                    {"id": "1", "text": "   ", "attributed_to": "user", "linked_memory_ids": []},
+                ]
+            }
+        )
+        with self.assertLogs("llms.openai_schema", level="WARNING") as logged:
+            _call(_llm(), returns=payload, response_format=WEAK)
+        joined = "\n".join(logged.output)
+        self.assertIn("empty text", joined)
+        self.assertIn("1 of 2", joined)
+
+    def test_a_clean_extraction_does_not_warn(self) -> None:
+        """A warning on every add would train the operator to ignore it."""
+        with self.assertLogs("llms.openai_schema", level="INFO") as logged:
+            _call(_llm(), returns=_payload("one", "two"), response_format=WEAK)
+        self.assertFalse([m for m in logged.output if m.startswith("WARNING")], logged.output)
+
+    def test_duplicates_are_counted_not_warned(self) -> None:
+        """Deduplication is expected behaviour — but mem0 logs it at DEBUG only, so at INFO
+        "the model repeated itself" and "extraction under-produced" look identical."""
+        with self.assertLogs("llms.openai_schema", level="INFO") as logged:
+            _call(_llm(), returns=_payload("same", "same", "other"), response_format=WEAK)
+        joined = "\n".join(logged.output)
+        self.assertIn("1 duplicate-in-batch", joined)
+        self.assertFalse([m for m in logged.output if m.startswith("WARNING")], logged.output)
+
+    def test_nothing_is_logged_when_nothing_was_constrained(self) -> None:
+        """An unupgraded call has no parsed model, so there is nothing to report."""
+        with mock.patch.object(OpenAILLM, "generate_response", return_value="anything"):
+            with self.assertNoLogs("llms.openai_schema", level="INFO"):
+                _llm().generate_response(MESSAGES)
+
+
 class SharedShapeTest(unittest.TestCase):
     def test_strict_constant_matches_what_is_sent(self) -> None:
         _, kwargs = _call(_llm(), response_format=WEAK)

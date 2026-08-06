@@ -172,6 +172,126 @@ class PromptAgreementTest(unittest.TestCase):
         self.assertIn('"memory"', ADDITIVE_EXTRACTION_PROMPT)
 
 
+class SilentDropTest(unittest.TestCase):
+    """Why `log_extraction` warns on blank text at all.
+
+    `llms/schema.py` claims mem0 discards a memory with empty `text` in COMPLETE silence, and the
+    provider overrides emit a WARNING on the strength of that claim. If it were wrong the warning
+    would be noise. So the claim is checked against the installed library rather than asserted in
+    a docstring.
+    """
+
+    # `if not text or text not in embed_map:` — the falsy-text guard, in the extraction loop.
+    _GUARD_RE = re.compile(r"if\s+not\s+text\s+or\s+text\s+not\s+in\s+\w+\s*:")
+
+    def _extraction_windows(self) -> list[str]:
+        windows = []
+        for match in _ENVELOPE_READ_RE.finditer(_SOURCE):
+            end = _METHOD_DEF_RE.search(_SOURCE, match.end())
+            windows.append(_SOURCE[match.end() : end.start() if end else len(_SOURCE)])
+        return windows
+
+    def test_the_falsy_text_guard_is_still_there(self) -> None:
+        hits = [w for w in self._extraction_windows() if self._GUARD_RE.search(w)]
+        self.assertTrue(
+            hits,
+            "mem0 no longer guards on falsy `text` the way llms/schema.py's blank_text_ids "
+            "docstring says. Re-read the extraction loop: either the drop is now logged (in "
+            "which case our WARNING is redundant) or it changed shape.",
+        )
+
+    def test_the_drop_is_unlogged(self) -> None:
+        """The `continue` must NOT be preceded by a log call — an unlogged drop is the whole
+        justification for warning about it on our side. Note the sibling duplicate-hash branch
+        immediately below it DOES log, at debug, which is why only blank text gets a warning."""
+        for window in self._extraction_windows():
+            match = self._GUARD_RE.search(window)
+            if not match:
+                continue
+            # The guard body: up to and including its `continue`.
+            body = window[match.end() : match.end() + 200]
+            body = body[: body.index("continue") + len("continue")] if "continue" in body else body
+            with self.subTest(body=body.strip()[:80]):
+                self.assertNotIn("logger", body)
+
+    def test_the_duplicate_branch_does_log_so_we_only_count_it(self) -> None:
+        for window in self._extraction_windows():
+            if "Skipping duplicate memory" in window:
+                self.assertIn("logger.debug", window)
+                return
+        self.fail("mem0's duplicate-hash branch not found; re-check duplicate_text_count()")
+
+
+class SalvagePathIsUnreachableTest(unittest.TestCase):
+    """Why `extract_json` is deliberately NOT reimplemented on the Pydantic side.
+
+    mem0's extraction parse has a salvage branch:
+
+        try:    json.loads(response, strict=False).get("memory", [])
+        except json.JSONDecodeError:
+                json.loads(extract_json(response), strict=False).get("memory", [])
+
+    `extract_json` (mem0/memory/utils.py) strips ``` fences, or failing that takes the span from
+    the first `{` to the last `}`. It exists for prose-wrapped or truncated output.
+
+    On the CONSTRAINED path it cannot run. The override validates with
+    `MemoryExtraction.model_validate_json` and raises on failure, so every value it returns has
+    already parsed as JSON; mem0 then parses with `strict=False`, which is strictly MORE permissive
+    than JSON (it tolerates raw control characters inside strings). Validated therefore implies
+    parseable, and the `except` is dead.
+
+    That is the argument for leaving it alone: a Pydantic reimplementation would have no caller.
+    These tests keep the argument honest — if pydantic-core and `json.loads` ever disagree on a
+    payload we would hand over, or if upstream restructures the fallback, this goes red.
+
+    Note the salvage branch is still LIVE on the unconstrained paths — MEM0_LLM_STRICT_SCHEMA=false
+    and Bedrock models that cannot enforce a schema — where we deliberately degrade to upstream
+    behaviour. `extract_json` must keep working; it just never sees our output.
+    """
+
+    # Valid under the schema, and awkward in the ways that historically broke JSON here: quoted
+    # JSON/YAML inside a memory (the documented cause of the ~19% invalid-JSON rate), backslashes,
+    # newlines, unicode, and a lone `}` that would fool a first-{-to-last-} salvage.
+    AWKWARD = [
+        'the gateway config is `{"port": 8800, "host": "0.0.0.0"}`',
+        "a windows path C:\\\\Users\\\\test and a regex \\\\d{7,40}",
+        "line one\nline two\ttabbed",
+        "em-dash — typographic “quotes” and an emoji 🚀",
+        "a closing brace } and an opening { out of order",
+        'nested "double \\"escaped\\"" quotes',
+        "",  # blank text is schema-valid; mem0 drops it, log_extraction warns
+    ]
+
+    def _payload(self, text: str) -> str:
+        return MemoryExtraction(
+            memory=[ExtractedMemory(id="0", text=text, attributed_to="user", linked_memory_ids=[])]
+        ).model_dump_json()
+
+    def test_pydantic_validated_output_always_parses_for_mem0(self) -> None:
+        """The invariant the whole argument rests on: validated => mem0's json.loads succeeds,
+        so the salvage branch never runs on our output."""
+        for text in self.AWKWARD:
+            with self.subTest(text=text[:40]):
+                raw = self._payload(text)
+                # Ours.
+                MemoryExtraction.model_validate_json(raw)
+                # Theirs, verbatim from main.py — must not raise.
+                recovered = json.loads(raw, strict=False).get("memory", [])
+                self.assertEqual(recovered[0]["text"], text)
+
+    def test_the_salvage_branch_is_still_shaped_as_assumed(self) -> None:
+        """If upstream stops routing the JSONDecodeError through extract_json, the reasoning above
+        needs re-checking rather than silently continuing to hold."""
+        self.assertIn("extract_json", _SOURCE)
+        self.assertRegex(_SOURCE, r"except json\.JSONDecodeError:")
+
+    def test_mem0_parses_with_strict_false(self) -> None:
+        """`strict=False` is what makes "validated implies parseable" true rather than merely
+        likely — it is more permissive than JSON, not less. If it ever becomes a strict parse,
+        pydantic-core and json.loads could disagree and the salvage branch becomes reachable."""
+        self.assertRegex(_SOURCE, r"json\.loads\(\s*\w+\s*,\s*strict=False\s*\)")
+
+
 class RoundTripTest(unittest.TestCase):
     """End to end through mem0's own parse, rather than through our model."""
 
