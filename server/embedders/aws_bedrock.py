@@ -78,15 +78,23 @@ class AsymmetricAWSBedrockEmbedding(AWSBedrockEmbedding):
             response_body = json.loads(response.get("body").read())
             return self._extract_cohere_vector(response_body)
         except Exception as e:
-            raise ValueError(f"Error getting embedding from AWS Bedrock: {e}")
+            raise ValueError(f"Error getting embedding from AWS Bedrock: {e}") from e
 
     @staticmethod
-    def _extract_cohere_vector(response_body: dict):
+    def _extract_cohere_vector(response_body: dict) -> list:
         """Read one vector out of either Cohere response shape.
 
         v3: `{"embeddings": [[...]]}`.  v4: `{"embeddings": {"float": [[...]]}}`.
         Raises rather than returning a dict key, because pgvector accepts a string and
         fails much later with an error naming neither the model nor this function.
+
+        The `isinstance` checks are what make that guarantee hold one level down, and they
+        are not defensive padding. `[0]` on a LIST-of-vectors is the vector; `[0]` on a
+        flat vector is a single float, and pgvector accepts that too — it lands as a
+        1-dimensional embedding and every later similarity score is quietly meaningless.
+        That is the same defect as reading a dict key, just harder to spot, so it fails
+        here instead. Found by `ty`: before the annotation, `.get()` on an unparameterized
+        dict is `object`, and subscripting it is unchecked.
         """
         embeddings = response_body.get("embeddings")
         if isinstance(embeddings, dict):
@@ -94,9 +102,15 @@ class AsymmetricAWSBedrockEmbedding(AWSBedrockEmbedding):
             if not vectors:
                 raise ValueError(f"no embedding vectors in response keys {list(embeddings)}")
             embeddings = vectors
-        if not embeddings:
-            raise ValueError("empty embeddings in Bedrock response")
-        return embeddings[0]
+        if not isinstance(embeddings, list) or not embeddings:
+            raise ValueError(f"empty embeddings in Bedrock response (got {type(embeddings).__name__})")
+        vector = embeddings[0]
+        if not isinstance(vector, list):
+            raise ValueError(
+                "Bedrock returned a flat embedding where a list of vectors was expected; "
+                f"first element is {type(vector).__name__}, not a vector"
+            )
+        return vector
 
     def embed(self, text, memory_action: Optional[Literal["add", "search", "update"]] = None):
         """Forward `memory_action` instead of dropping it.

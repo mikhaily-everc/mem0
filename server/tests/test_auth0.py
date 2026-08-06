@@ -95,7 +95,10 @@ class Auth0TokenTest(unittest.TestCase):
         auth0._jwks._keys = {KID: self.jwk}
         auth0._jwks._fetched_at = time.monotonic()
         auth0._jwks._last_miss_fetch = 0.0
-        auth0._jwks._fetch = self._counting_fetch
+        # Rebinding an instance attribute over a method is how the fetch gets counted. ty
+        # is right that a bound method is not assignable to the declared function type;
+        # that mismatch is the technique, not a mistake.
+        auth0._jwks._fetch = self._counting_fetch  # ty: ignore[invalid-assignment]
 
     def _counting_fetch(self) -> dict[str, dict]:
         self.fetch_count += 1
@@ -177,9 +180,7 @@ class Auth0TokenTest(unittest.TestCase):
         )
 
     def test_rejects_alg_none(self) -> None:
-        header = base64url_encode(
-            json.dumps({"alg": "none", "typ": "JWT", "kid": KID}).encode()
-        ).decode()
+        header = base64url_encode(json.dumps({"alg": "none", "typ": "JWT", "kid": KID}).encode()).decode()
         payload = base64url_encode(json.dumps(self._claims()).encode()).decode()
         self._assert_rejected(f"{header}.{payload}.", "an unsigned token is not a credential")
 
@@ -371,7 +372,9 @@ class AdoptionClosesThePasswordDoorTest(unittest.TestCase):
         )
 
         adopted = SimpleNamespace(auth0_sub=None, email="poc-admin@everc.com", password_hash=hashed)
-        auth_module.adopt_row_into_sso(adopted, "auth0|123")
+        # A real `User` would need a Session and a live table to prove a two-attribute
+        # mutation. adopt_row_into_sso touches only `auth0_sub` and `password_hash`.
+        auth_module.adopt_row_into_sso(adopted, "auth0|123")  # ty: ignore[invalid-argument-type]
 
         self.assertFalse(
             auth_module.verify_password("the-old-password", adopted.password_hash),
@@ -381,7 +384,8 @@ class AdoptionClosesThePasswordDoorTest(unittest.TestCase):
     def test_adoption_still_links_the_sso_subject(self) -> None:
         """Closing the door must not cost the linkage the adoption exists to create."""
         adopted = SimpleNamespace(auth0_sub=None, email="poc-admin@everc.com", password_hash="x")
-        auth_module.adopt_row_into_sso(adopted, "auth0|123")
+        # Same duck-typed row as the test above.
+        auth_module.adopt_row_into_sso(adopted, "auth0|123")  # ty: ignore[invalid-argument-type]
         self.assertEqual(adopted.auth0_sub, "auth0|123")
 
 

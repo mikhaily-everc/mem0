@@ -185,6 +185,23 @@ class ResponseShapeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             instance.embed("text", "add")
 
+    def test_a_flat_vector_raises_instead_of_returning_one_float(self) -> None:
+        """The same defect as returning a dict key, one level down. `[0]` on a list OF
+        vectors is the vector; `[0]` on a flat vector is a float, and pgvector accepts
+        that too — it stores a 1-dimensional embedding and every later similarity score
+        is quietly meaningless. Surfaced by `ty`, which pointed out that the value being
+        subscripted was never typed at all."""
+        instance, _ = _embedder(V4_MODEL, {"embeddings": {"float": [0.1] * DIMS}})
+        with self.assertRaises(ValueError) as caught:
+            instance.embed("text", "add")
+        self.assertIn("flat embedding", str(caught.exception))
+
+    def test_a_non_list_embeddings_field_raises(self) -> None:
+        """A provider error body where the vectors should be, e.g. a bare string."""
+        instance, _ = _embedder(V4_MODEL, {"embeddings": "throttled"})
+        with self.assertRaises(ValueError):
+            instance.embed("text", "add")
+
 
 class NonCohereProvidersUnchangedTest(unittest.TestCase):
     """Titan is what is deployed today; this override must not touch it."""

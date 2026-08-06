@@ -107,7 +107,10 @@ def revoke_key(key_id: str, user: User = Depends(require_auth), db: Session = De
     try:
         key_uuid = uuid.UUID(key_id)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=404, detail="API key not found.")
+        # `from None`: an unparseable id is input validation, and the 404 is meant to
+        # read identically to "exists but is not yours" — see the ownership check
+        # below. The parse error adds nothing.
+        raise HTTPException(status_code=404, detail="API key not found.") from None
     api_key = db.get(APIKey, key_uuid)
     if api_key is None or api_key.created_by != user.id:
         raise HTTPException(status_code=404, detail="API key not found.")

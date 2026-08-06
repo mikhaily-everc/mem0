@@ -11,7 +11,9 @@ import cleanly on a developer's machine and fail only inside the container.
 """
 
 load("@bazel_lib//lib:transitions.bzl", "platform_transition_test")
+load("@aspect_rules_lint//format:defs.bzl", "format_test")
 load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
+load("@ideaprojects//tools/lint:linters.bzl", "ruff_test", "ty_test")
 load("@pypi_mem0//:defs.bzl", "group_deps_for")
 
 package(default_visibility = ["@ideaprojects//tools/mcp/mem0:__subpackages__"])
@@ -187,4 +189,102 @@ platform_transition_test(
     name = "openai_schema_test",
     binary = ":openai_schema_test_impl",
     target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)
+
+# The contract test, and the only one here that can go red because SOMETHING ELSE changed.
+# Every other test in tests/ compares our schema against our own constant, which is why all of
+# them passed while extraction was constrained to `{"facts": [...]}` and mem0 read `.get("memory")`
+# — a grammar that forced a key the library does not read, so `POST /memories` answered 200 with
+# an empty results list on every write. This one reads the INSTALLED mem0 wheel and the DEPLOYED
+# ADDITIVE_EXTRACTION_PROMPT and compares the schema to those. A wheel bump that renames the
+# envelope key or adds a prompt field turns it red on purpose.
+py_test(
+    name = "extraction_schema_test_impl",
+    size = "small",
+    srcs = ["tests/test_extraction_schema.py"],
+    dep_group = "mem0-server",
+    main = "tests/test_extraction_schema.py",
+    tags = ["manual"],
+    deps = [":server"],
+)
+
+platform_transition_test(
+    name = "extraction_schema_test",
+    binary = ":extraction_schema_test_impl",
+    target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)
+
+# Ruff over this server's Python. Config comes from @ideaprojects//:.ruff.toml, and it has to be
+# the ROOT one: ruff takes no config flag in the rules_lint action and discovers one by walking up
+# from each source file. Under a sandbox that walk-up leaves external/mem0+/server/ and reaches
+# the execroot without passing any other config, so a config nearer these sources would be an
+# action input that is never read.
+#
+# TWO non-obvious tags, and without either one this target passes while linting NOTHING:
+#
+#   python          rules_lint's ruff aspect visits py_binary/py_library/py_test by kind, and
+#                   otherwise only a filegroup carrying one of its `filegroup_tags`.
+#   lint-genfiles   rules_lint's `filter_srcs` keeps only sources whose
+#                   `owner.workspace_name == ""`, i.e. main-repo files. Every file here is owned
+#                   by @mem0, so all of them are filtered out and the aspect falls through to
+#                   `noop_lint_action` — a green test over zero files. This tag is the only lever
+#                   that returns srcs unfiltered. Its name is about generated files; the effect
+#                   is "do not filter", which is what an external repo needs.
+#
+# A filegroup rather than :server because :server's deps are @pypi_mem0 hub aliases gated on
+# `dep_group`, which py_library cannot set — analysing it from a target that does not set it
+# resolves those to @platforms//:incompatible. Ruff needs the sources, not the venv.
+filegroup(
+    name = "python_sources",
+    srcs = glob(
+        ["**/*.py"],
+        allow_empty = False,
+        # Next.js operator UI; holds no Python, excluded here to say so deliberately.
+        exclude = ["dashboard/**"],
+    ),
+    tags = [
+        "lint-genfiles",
+        "python",
+    ],
+)
+
+ruff_test(
+    name = "ruff_lint",
+    srcs = [":python_sources"],
+    # Wider than this package's default so @ideaprojects//tools/lint:lint_checks can list it.
+    # Every other test here runs only when named directly; this one is a gate.
+    visibility = ["@ideaprojects//tools/lint:__pkg__"],
+)
+
+ty_test(
+    name = "ty_lint",
+    srcs = [":python_sources"],
+    visibility = ["@ideaprojects//tools/lint:__pkg__"],
+)
+
+# `ruff format --check` over the same sources. Declared HERE rather than picked up by
+# @ideaprojects//tools/lint:format_test, whose srcs are `//:all_format_sources` — a
+# gazelle-maintained aggregate of main-repo packages only, which no external repo can join.
+# Without this target the fork's Python is linted and type-checked but never format-checked,
+# and ruff's linter and formatter share `line-length` from //:.ruff.toml, so the two would
+# drift silently.
+#
+# `disable_git_attribute_checks` is mandatory in a sandbox: rules_lint's format.sh runs
+# `git check-attr` and there is no .git there.
+# @ideaprojects//:.ruff.toml is in `srcs`, and it is load-bearing rather than decorative:
+# format_test has no `configs` attribute (see format/defs.bzl — the generated sh_test's `data`
+# is exactly [tool, srcs]), so srcs is the ONLY way to get a file into the sandbox. Without it
+# ruff finds no config during its walk-up and silently formats at its built-in 88 columns while
+# the linter and `aspect run //tools/lint:format.python` use the 120 from that file — a check
+# that fails on code the fixer just produced. The Python filter in format.sh ignores the .toml.
+format_test(
+    name = "format_check",
+    size = "small",
+    srcs = [
+        ":python_sources",
+        "@ideaprojects//:.ruff.toml",
+    ],
+    disable_git_attribute_checks = True,
+    python = "@aspect_rules_lint//lint:ruff_bin",
+    visibility = ["@ideaprojects//tools/lint:__pkg__"],
 )

@@ -125,9 +125,12 @@ def register(request: Request, body: RegisterRequest, db: Session = Depends(get_
     db.add(user)
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=403, detail="Registration is closed. An admin account already exists.")
+        # Chained: the violated constraint is the only thing that says WHICH guard
+        # fired — ix_users_only_one_admin (the documented race) or the email unique
+        # index (a different bug wearing the same 403).
+        raise HTTPException(status_code=403, detail="Registration is closed. An admin account already exists.") from exc
     db.refresh(user)
 
     capture_admin_registered(email=body.email)

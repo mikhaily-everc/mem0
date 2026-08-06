@@ -279,11 +279,7 @@ DEFAULT_CONFIG = {
             **(
                 {
                     **({"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}),
-                    **(
-                        {"is_reasoning_model": LLM_IS_REASONING_MODEL}
-                        if LLM_IS_REASONING_MODEL is not None
-                        else {}
-                    ),
+                    **({"is_reasoning_model": LLM_IS_REASONING_MODEL} if LLM_IS_REASONING_MODEL is not None else {}),
                 }
                 if LLM_PROVIDER == "openai"
                 else {}
@@ -526,8 +522,8 @@ def generate_instructions(req: GenerateInstructionsRequest, _auth=Depends(verify
             instructions = parts[0].replace("INSTRUCTIONS:", "").strip()
             test_message = parts[1].strip()
         return {"custom_instructions": instructions, "test_message": test_message}
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.post("/memories", summary="Create memories")
@@ -555,9 +551,9 @@ def add_memory(memory_create: MemoryCreate, scope: MemoryScope = Depends(resolve
             telemetry.log_dashboard_nudge_once(DASHBOARD_URL)
         return JSONResponse(content=response)
     except (ValueError, Mem0ValidationError) as e:
-        raise _client_error(e)
-    except Exception:
-        raise upstream_error()
+        raise _client_error(e) from e
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 ALL_MEMORIES_LIMIT = 1000
@@ -618,9 +614,7 @@ def get_all_memories(
             # so even an admin SSO caller takes the scoped branch and cannot read
             # the whole store through this route.
             return _list_all_memories(limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT)
-        filters = {
-            k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
-        }
+        filters = {k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v}
         params = {"filters": filters}
         if top_k is not None:
             params["top_k"] = top_k
@@ -628,8 +622,8 @@ def get_all_memories(
         return get_memory_instance().get_all(**params)
     except HTTPException:
         raise
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 def _fetch_owned_memory(memory_id: str, scope: MemoryScope) -> Dict[str, Any]:
@@ -641,8 +635,8 @@ def _fetch_owned_memory(memory_id: str, scope: MemoryScope) -> Dict[str, Any]:
     """
     try:
         memory = get_memory_instance().get(memory_id)
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
     if memory is None:
         raise HTTPException(status_code=404, detail="Memory not found.")
@@ -692,11 +686,11 @@ def search_memories(search_req: SearchRequest, scope: MemoryScope = Depends(reso
             params["show_expired"] = search_req.show_expired
         return get_memory_instance().search(query=search_req.query, filters=filters, **params)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException:
         raise
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.put("/memories/{memory_id}", summary="Update a memory")
@@ -718,9 +712,9 @@ def update_memory(
             params["expiration_date"] = updated_memory.expiration_date
         return get_memory_instance().update(**params)
     except (ValueError, Mem0ValidationError) as e:
-        raise _client_error(e)
-    except Exception:
-        raise upstream_error()
+        raise _client_error(e) from e
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.get("/memories/{memory_id}/history", summary="Get memory history")
@@ -729,8 +723,8 @@ def memory_history(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
     _fetch_owned_memory(memory_id, scope)
     try:
         return get_memory_instance().history(memory_id=memory_id)
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.delete("/memories/{memory_id}", summary="Delete a memory", response_model=MessageResponse)
@@ -741,9 +735,9 @@ def delete_memory(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
         get_memory_instance().delete(memory_id=memory_id)
         return MessageResponse(message="Memory deleted successfully")
     except (ValueError, Mem0ValidationError) as e:
-        raise _client_error(e)
-    except Exception:
-        raise upstream_error()
+        raise _client_error(e) from e
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.delete("/memories", summary="Delete all memories", response_model=MessageResponse)
@@ -764,13 +758,11 @@ def delete_all_memories(
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
     try:
-        params = {
-            k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
-        }
+        params = {k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v}
         get_memory_instance().delete_all(**params)
         return MessageResponse(message="All relevant memories deleted")
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.post("/reset", summary="Reset all memories")
@@ -787,8 +779,8 @@ def reset_memory(_auth=Depends(require_admin), scope: MemoryScope = Depends(reso
     try:
         get_memory_instance().reset()
         return {"message": "All memories reset"}
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
 
 
 @app.get("/", summary="Redirect to the OpenAPI documentation", include_in_schema=False)

@@ -28,13 +28,13 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-from llms.schema import FACTS_SCHEMA, FactExtraction
+from llms.schema import MEMORY_SCHEMA, MemoryExtraction, ParsedJson
 from mem0.llms.aws_bedrock import AWSBedrockLLM
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ConstrainedAWSBedrockLLM", "FACTS_SCHEMA", "FactExtraction"]
+__all__ = ["ConstrainedAWSBedrockLLM", "MEMORY_SCHEMA", "MemoryExtraction"]
 
 # Substrings, not exact ids, because the deployed id carries an inference-profile prefix and a
 # version suffix (e.g. `us.anthropic.claude-haiku-4-5-20251001-v1:0`).
@@ -70,8 +70,12 @@ class ConstrainedAWSBedrockLLM(AWSBedrockLLM):
         # unconstrained call has nothing to constrain — leave both to the library.
         if tools or not self._wants_json(response_format):
             return super().generate_response(
-                messages, response_format=response_format, tools=tools,
-                tool_choice=tool_choice, stream=stream, **kwargs,
+                messages,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                **kwargs,
             )
 
         if not self.supports_schema():
@@ -84,8 +88,12 @@ class ConstrainedAWSBedrockLLM(AWSBedrockLLM):
                 self.config.model,
             )
             return super().generate_response(
-                messages, response_format=response_format, tools=tools,
-                tool_choice=tool_choice, stream=stream, **kwargs,
+                messages,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                **kwargs,
             )
 
         return self._generate_constrained(messages)
@@ -109,9 +117,9 @@ class ConstrainedAWSBedrockLLM(AWSBedrockLLM):
                     "type": "json_schema",
                     "structure": {
                         "jsonSchema": {
-                            "name": "fact_extraction",
-                            "description": "Facts extracted from the input.",
-                            "schema": json.dumps(FACTS_SCHEMA),
+                            "name": "memory_extraction",
+                            "description": "Memories extracted from the input.",
+                            "schema": json.dumps(MEMORY_SCHEMA),
                         }
                     },
                 }
@@ -138,18 +146,18 @@ class ConstrainedAWSBedrockLLM(AWSBedrockLLM):
         # Validate rather than trust. The grammar should make this unreachable, which is
         # precisely why a failure here is worth surfacing loudly: it means the constraint did
         # not apply (an unexpected fallback, a refusal, a provider change) and we would
-        # otherwise hand mem0 something it will silently turn into "no new facts found".
+        # otherwise hand mem0 something it will silently turn into "no new memories found".
         # mem0's caller re-raises LLM errors as LLMError, so this reaches the operator instead
         # of becoming a 200 with an empty results list.
         try:
-            FactExtraction.model_validate_json(text)
+            parsed = MemoryExtraction.model_validate_json(text)
         except ValidationError as exc:
             raise ValueError(
-                f"Bedrock returned output that does not match the facts schema despite "
+                f"Bedrock returned output that does not match the extraction schema despite "
                 f"grammar constraint (stopReason={stop_reason!r}): {exc}"
             ) from exc
 
-        # Return the original text, not a re-serialisation: mem0 does its own
-        # extract_json/json.loads on this string, and round-tripping through Pydantic would
-        # change key order and whitespace for no benefit.
-        return text
+        # A str subclass carrying the parsed model, NOT a bare BaseModel: mem0 does its own
+        # remove_code_blocks/json.loads on this value. It also keeps the original bytes rather
+        # than re-serialising through Pydantic, which would change key order for no benefit.
+        return ParsedJson(text, parsed)

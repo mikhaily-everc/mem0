@@ -92,6 +92,6 @@ def delete_entity(
         raise HTTPException(status_code=404, detail="Entity not found.")
     try:
         get_memory_instance().delete_all(**{TYPE_TO_FIELD[entity_type]: entity_id})
-    except Exception:
-        raise upstream_error()
+    except Exception as exc:
+        raise upstream_error() from exc
     return MessageResponse(message="Entity deleted")

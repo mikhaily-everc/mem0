@@ -88,7 +88,11 @@ def consume_refresh_jti(jti: str, db: Session) -> None:
     try:
         jti_uuid = uuid.UUID(jti)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Refresh token is no longer valid.")
+        # `from None`, not `from exc`: a malformed jti is input validation, and the
+        # 401 deliberately reads the same as a replayed or expired one — the parse
+        # error carries nothing an operator wants and telling the two apart is an
+        # oracle. Same reasoning as the auth0 branch below.
+        raise HTTPException(status_code=401, detail="Refresh token is no longer valid.") from None
     now = datetime.now(timezone.utc)
     result = db.execute(
         update(RefreshTokenJti)
@@ -107,8 +111,8 @@ def consume_refresh_jti(jti: str, db: Session) -> None:
 def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, _get_secret(), algorithms=[JWT_ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.") from exc
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -236,14 +240,17 @@ def _resolve_user_from_auth0(claims: Auth0Claims, db: Session) -> User:
 
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         # Two concurrent first-time logins raced on the unique index. The loser
         # rolls back and re-reads the winner's row — same pattern as the register
         # handler in routers/auth.py.
         db.rollback()
         user = db.scalar(select(User).where(User.auth0_sub == claims.sub))
         if user is None:
-            raise HTTPException(status_code=500, detail="Could not provision SSO account.")
+            # Chained: reaching here means the row is missing after a constraint
+            # violation said it exists, which is not the documented race and the
+            # constraint name is the only clue to what actually happened.
+            raise HTTPException(status_code=500, detail="Could not provision SSO account.") from exc
         return user
 
     db.refresh(user)
@@ -277,14 +284,16 @@ async def verify_auth(
                 # signature, audience, issuer or expiry is an oracle. Without this
                 # log a misconfiguration is indistinguishable from a bad token
                 # from the outside, which is a bad place to debug from.
-                logging.warning(
-                    "auth0: rejected a bearer token: %s (cause: %r)", exc, exc.__cause__
-                )
+                logging.warning("auth0: rejected a bearer token: %s (cause: %r)", exc, exc.__cause__)
+                # `from None`: the cause has just been logged above, deliberately
+                # server-side only. Chaining it here would put the same detail into
+                # the traceback of a response the comment above says must stay
+                # indistinguishable from any other bad token.
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid or expired token.",
                     headers={"WWW-Authenticate": "Bearer"},
-                )
+                ) from None
             _mark_auth_type(request, "auth0")
             request.state.auth0_claims = claims
             return _resolve_user_from_auth0(claims, db)
@@ -326,7 +335,12 @@ async def require_auth(
 
 
 _BOOTSTRAP_ADMIN = User(
-    id=uuid.UUID(int=0), name="admin_api_key", email="", password_hash="", role="admin", created_at=datetime.min.replace(tzinfo=timezone.utc),
+    id=uuid.UUID(int=0),
+    name="admin_api_key",
+    email="",
+    password_hash="",
+    role="admin",
+    created_at=datetime.min.replace(tzinfo=timezone.utc),
 )
 
 
