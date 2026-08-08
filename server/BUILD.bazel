@@ -143,6 +143,24 @@ py_test(
     deps = [":server"],
 )
 
+py_test(
+    name = "list_scoping_test_impl",
+    size = "small",
+    srcs = ["tests/test_list_scoping.py"],
+    dep_group = "mem0-server",
+    main = "tests/test_list_scoping.py",
+    tags = ["manual"],
+    deps = [":server"],
+)
+
+# Transitioned for the same reason as auth0_test above: the @pypi_mem0 wheels
+# resolve for linux/glibc, which is what the image ships.
+platform_transition_test(
+    name = "list_scoping_test",
+    binary = ":list_scoping_test_impl",
+    target_platform = "@ideaprojects//tools/mcp/mem0/server:linux_x86_64",
+)
+
 platform_transition_test(
     name = "bedrock_embedder_test",
     binary = ":bedrock_embedder_test_impl",

@@ -28,6 +28,7 @@ from errors import (
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from listing import listing_filters
 from llms import install_overrides as install_llm_overrides
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from models import RequestLog, User
@@ -597,6 +598,14 @@ def get_all_memories(
     user_id: Optional[str] = None,
     run_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    include_agent_scoped: bool = Query(
+        True,
+        description=(
+            "Set false to return only memories with no agent_id. Needed because this route "
+            "is LIMIT-only with no ORDER BY or OFFSET: once agent-scoped rows outnumber the "
+            "cap, unscoped ones become unreachable."
+        ),
+    ),
     top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
     show_expired: bool = Query(False),
     _auth=Depends(verify_auth),
@@ -614,7 +623,10 @@ def get_all_memories(
             # so even an admin SSO caller takes the scoped branch and cannot read
             # the whole store through this route.
             return _list_all_memories(limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT)
-        filters = {k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v}
+        # Both `$not` and the `"*"` key-exists test are handled by the vector store's
+        # _build_filter_conditions, and they survive get_all untouched — it copies the
+        # filter dict and validates only the three entity ids.
+        filters = listing_filters(user_id, run_id, agent_id, include_agent_scoped)
         params = {"filters": filters}
         if top_k is not None:
             params["top_k"] = top_k
