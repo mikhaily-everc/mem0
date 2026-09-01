@@ -8,6 +8,7 @@ import telemetry
 from auth import (
     ADMIN_API_KEY,
     AUTH_DISABLED,
+    AUTHOR_SUB_KEY,
     JWT_SECRET,
     MemoryScope,
     require_admin,
@@ -28,7 +29,7 @@ from errors import (
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from listing import listing_filters
+from listing import listing_filters, read_scopes
 from llms import install_overrides as install_llm_overrides
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from models import RequestLog, User
@@ -368,6 +369,14 @@ class SearchRequest(BaseModel):
     threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
     explain: Optional[bool] = Field(None, description="Include score details for each search result.")
     show_expired: Optional[bool] = Field(None, description="Include expired memories.")
+    include_shared: bool = Field(
+        False,
+        description=(
+            "Also search the reserved repo-wide scopes. Off by default so an existing "
+            "caller's result set is unchanged: recall thresholds are fitted to the corpus "
+            "they were measured against, and widening it silently would move them."
+        ),
+    )
 
 
 class GenerateInstructionsRequest(BaseModel):
@@ -537,8 +546,25 @@ def add_memory(memory_create: MemoryCreate, scope: MemoryScope = Depends(resolve
     # "at least one identifier" check below would reject every request if it ran
     # first. Assigning into `params` rather than the model keeps the request body
     # untouched for logging.
+    #
+    # A `metadata.scope` naming a reserved shared scope redirects the write there
+    # instead of into the caller's own pinned scope, and stamps their verified
+    # subject onto the row so `may_modify` can tell later who is allowed to change
+    # it. `shared_write` returns a COPY of the metadata for the same reason the
+    # comment above assigns into `params` — the request body stays intact for the
+    # request log. It raises 400 on an unrecognised scope rather than falling back
+    # to a private write.
+    shared = scope.shared_write(memory_create.metadata)
     pinned = scope.pin(memory_create.user_id)
-    if pinned is not None:
+    if shared is not None:
+        # A shared row is repo-wide by construction, so its grouping ids are not the
+        # writer's to choose — `run_id` is what the console's fact panel uses to
+        # decide whose memory a row is presented as belonging to. Checked here rather
+        # than inside `shared_write` because `agent_id`/`run_id` also arrive as
+        # top-level parameters, which that method never sees.
+        scope.reject_shared_grouping_ids(memory_create.agent_id, memory_create.run_id, memory_create.metadata)
+        params["user_id"], params["metadata"] = shared
+    elif pinned is not None:
         params["user_id"] = pinned
     elif "user_id" in params:
         del params["user_id"]
@@ -586,6 +612,44 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
     }
 
 
+def _merge_pages(pages: List[Dict[str, Any]], order_by_score: bool, cap: Optional[int]) -> Dict[str, Any]:
+    """Fold the per-scope responses of one logical read into a single response.
+
+    A single-scope read — every read that does not opt into `include_shared`, which
+    is all of them by default — returns the library's response object untouched.
+    That is not an optimisation: it is the guarantee that the default path is
+    byte-for-byte what it was before shared scopes existed, including any keys a
+    future `mem0ai` adds beside `results`. Only the opt-in path is folded, and the
+    fold still carries the first page's sibling keys forward.
+
+    `order_by_score` reconstructs the global ranking a single query would have
+    produced. It is sound only because the pages are over disjoint `user_id` sets,
+    were embedded from the same query, and score on the same `1 - distance` scale —
+    so the true global top-k is contained in the union of the per-page top-ks. It is
+    NOT sound for a listing, which is why the listing passes False: the vector
+    store's `list()` is LIMIT-only with no ORDER BY, so its rows carry no score at
+    all and arrive in heap order.
+
+    `cap` is None for a listing for the same reason. Truncating the union there
+    would drop rows at heap-order random, and the console's citation graph needs
+    the shared row PRESENT in the listing or the id it is cutting the ego graph
+    around is not a node and the graph comes back empty — for the author too. So
+    `top_k` becomes a per-scope cap on the opt-in listing path rather than a total.
+    """
+    if len(pages) == 1:
+        return pages[0]
+    merged = dict(pages[0])
+    results: List[Any] = []
+    for page in pages:
+        results.extend(page.get("results") or [])
+    if order_by_score:
+        results.sort(key=lambda row: row.get("score") or 0.0, reverse=True)
+    if cap is not None:
+        results = results[:cap]
+    merged["results"] = results
+    return merged
+
+
 def _list_all_memories(limit: int = ALL_MEMORIES_LIMIT) -> Dict[str, Any]:
     results = get_memory_instance().vector_store.list(top_k=limit)
     rows = results[0] if results and isinstance(results, list) and isinstance(results[0], list) else results or []
@@ -604,6 +668,15 @@ def get_all_memories(
             "Set false to return only memories with no agent_id. Needed because this route "
             "is LIMIT-only with no ORDER BY or OFFSET: once agent-scoped rows outnumber the "
             "cap, unscoped ones become unreachable."
+        ),
+    ),
+    include_shared: bool = Query(
+        False,
+        description=(
+            "Also list the reserved repo-wide scopes. Off by default so an existing "
+            "caller's result set is unchanged. `top_k` becomes a per-scope cap when this "
+            "is set, because this route has no ORDER BY and truncating the union would "
+            "drop rows at random."
         ),
     ),
     top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
@@ -626,12 +699,18 @@ def get_all_memories(
         # Both `$not` and the `"*"` key-exists test are handled by the vector store's
         # _build_filter_conditions, and they survive get_all untouched — it copies the
         # filter dict and validates only the three entity ids.
-        filters = listing_filters(user_id, run_id, agent_id, include_agent_scoped)
-        params = {"filters": filters}
-        if top_k is not None:
-            params["top_k"] = top_k
-        params["show_expired"] = show_expired
-        return get_memory_instance().get_all(**params)
+        #
+        # `include_shared` is gated on `is_pinned`: an unpinned caller already sees
+        # every scope, so a second pass would only return the shared rows twice.
+        pages: List[Dict[str, Any]] = []
+        for scope_user_id in read_scopes(user_id, include_shared and scope.is_pinned):
+            filters = listing_filters(scope_user_id, run_id, agent_id, include_agent_scoped)
+            params = {"filters": filters}
+            if top_k is not None:
+                params["top_k"] = top_k
+            params["show_expired"] = show_expired
+            pages.append(get_memory_instance().get_all(**params))
+        return _merge_pages(pages, order_by_score=False, cap=None)
     except HTTPException:
         raise
     except Exception as exc:
@@ -658,6 +737,36 @@ def _fetch_owned_memory(memory_id: str, scope: MemoryScope) -> Dict[str, Any]:
     return memory
 
 
+def _fetch_writable_memory(memory_id: str, scope: MemoryScope) -> Dict[str, Any]:
+    """Like `_fetch_owned_memory`, but for the routes that MUTATE the row.
+
+    Every read of a shared row succeeds; only its author (or an admin) may change
+    or remove it. `_fetch_owned_memory` alone is not that check — after the shared
+    widening it answers True for every pinned caller on a shared row, so a mutating
+    route that kept using it would let anyone overwrite a repo-wide note.
+
+    403, not the 404 `_fetch_owned_memory` uses. That 404 exists so these routes are
+    not an id oracle, but a shared row's existence is not a secret from this caller
+    — they can read it through this very id — so the honest answer is "you did not
+    write this one".
+
+    `author_sub` is nested under `metadata`: mem0's `Memory.get()` promotes only
+    `user_id`/`agent_id`/`run_id`/`actor_id`/`role`/`attributed_to`/`expiration_date`
+    to the top level and buckets every other payload key into `metadata`, which it
+    omits entirely when empty. Reading `memory["author_sub"]` would therefore be
+    None for every row on earth and lock the author out of their own note.
+    """
+    memory = _fetch_owned_memory(memory_id, scope)
+    owner = memory.get("user_id") if isinstance(memory, dict) else None
+    author = (memory.get("metadata") or {}).get(AUTHOR_SUB_KEY) if isinstance(memory, dict) else None
+    if not scope.may_modify(owner, author):
+        raise HTTPException(
+            status_code=403,
+            detail="This memory is shared and was written by someone else. Ask its author to change it.",
+        )
+    return memory
+
+
 @app.get("/memories/{memory_id}", summary="Get a memory")
 def get_memory(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
     """Retrieve a specific memory by ID."""
@@ -681,12 +790,6 @@ def search_memories(search_req: SearchRequest, scope: MemoryScope = Depends(reso
                 ", ".join(deprecated_keys),
                 ", ".join(f'"{k}": "..."' for k in deprecated_keys),
             )
-        # Pin `filters["user_id"]`, NOT just the deprecated top-level field.
-        # `filters` is a free-form passthrough dict and upstream's own deprecation
-        # notice tells callers to put `user_id` in it, so pinning only the
-        # top-level field would leave the documented route wide open.
-        if scope.is_pinned:
-            filters["user_id"] = scope.pinned_user_id
         params = {}
         if search_req.top_k is not None:
             params["top_k"] = search_req.top_k
@@ -696,7 +799,43 @@ def search_memories(search_req: SearchRequest, scope: MemoryScope = Depends(reso
             params["explain"] = search_req.explain
         if search_req.show_expired is not None:
             params["show_expired"] = search_req.show_expired
-        return get_memory_instance().search(query=search_req.query, filters=filters, **params)
+
+        # An unpinned caller's filters are passed through exactly as before —
+        # `include_shared` is a no-op for them because they already see every scope.
+        if not scope.is_pinned:
+            return get_memory_instance().search(query=search_req.query, filters=filters, **params)
+
+        # Refuse anything that could outrun the pin BEFORE building it. `{**filters,
+        # "user_id": sid}` looks like it settles the question and does not: mem0
+        # flattens an `AND` group back over the top level and then `update()`s it
+        # onto the effective filters, so a caller who puts `user_id` ahead of `AND`
+        # in their JSON reads any other person's scope. See
+        # `MemoryScope.reject_scope_escaping_filters` for the full mechanism.
+        #
+        # This is the whole surface: `filters` is the only free-form dict a caller
+        # can put in front of the vector store on any route. `GET /memories` takes no
+        # `filters` at all and builds its own from three scalar query params.
+        scope.reject_scope_escaping_filters(filters)
+
+        # Pin `filters["user_id"]`, NOT just the deprecated top-level field.
+        # `filters` is a free-form passthrough dict and upstream's own deprecation
+        # notice tells callers to put `user_id` in it, so pinning only the
+        # top-level field would leave the documented route wide open.
+        #
+        # Only `user_id` is swapped per scope; every other filter the caller sent
+        # rides along untouched. That matters for the console's memory page, which
+        # resolves a row's facts with `filters: {run_id: <id>}` — rebuilding the
+        # filter dict here instead of copying it would drop the `run_id` and answer
+        # with the whole scope.
+        pages = [
+            get_memory_instance().search(query=search_req.query, filters={**filters, "user_id": sid}, **params)
+            for sid in read_scopes(scope.pinned_user_id, search_req.include_shared)
+        ]
+        # `cap` is the caller's own `top_k` and nothing else. Substituting the
+        # library's default would hardcode a number this server does not own —
+        # requirements.txt pins `mem0ai>=0.1.48`, a floor — so when no `top_k` was
+        # asked for the merged union is returned ranked but uncut.
+        return _merge_pages(pages, order_by_score=True, cap=search_req.top_k)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException:
@@ -712,7 +851,20 @@ def update_memory(
     scope: MemoryScope = Depends(resolve_scope),
 ):
     """Update an existing memory."""
-    _fetch_owned_memory(memory_id, scope)
+    # Order matters: refuse an ownership rewrite before spending a `get` on it, and
+    # settle authorship before touching the row at all.
+    scope.reject_ownership_metadata(updated_memory.metadata)
+    memory = _fetch_writable_memory(memory_id, scope)
+    # The rest of the metadata guard needs the row in hand. `scope`/`author_sub` are
+    # compared against what is stored — echoing them back is how a GET, edit, PUT
+    # round trip works, so only a CHANGE is refused — and the grouping ids are
+    # refused outright on a shared row, which is where `run_id` stops being grouping
+    # and becomes "whose memory this claims to be a fact of".
+    scope.reject_row_metadata_conflicts(
+        updated_memory.metadata,
+        memory.get("user_id") if isinstance(memory, dict) else None,
+        memory.get("metadata") if isinstance(memory, dict) else None,
+    )
     try:
         fields_set = getattr(updated_memory, "model_fields_set", getattr(updated_memory, "__fields_set__", set()))
         params = {"memory_id": memory_id}
@@ -742,7 +894,7 @@ def memory_history(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
 @app.delete("/memories/{memory_id}", summary="Delete a memory", response_model=MessageResponse)
 def delete_memory(memory_id: str, scope: MemoryScope = Depends(resolve_scope)):
     """Delete a specific memory by ID."""
-    _fetch_owned_memory(memory_id, scope)
+    _fetch_writable_memory(memory_id, scope)
     try:
         get_memory_instance().delete(memory_id=memory_id)
         return MessageResponse(message="Memory deleted successfully")

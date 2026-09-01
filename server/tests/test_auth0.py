@@ -20,6 +20,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import mem0.memory.main as mem0_main
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
@@ -347,6 +348,630 @@ class MemoryScopeTest(unittest.TestCase):
     def test_is_pinned_reflects_the_presence_of_a_scope(self) -> None:
         self.assertTrue(self.PINNED.is_pinned)
         self.assertFalse(self.UNPINNED.is_pinned)
+
+
+class SharedScopeIsReadableByEveryoneTest(unittest.TestCase):
+    """The read half of the shared scope: a committed memory URL must resolve.
+
+    WHY THIS EXISTS. Every memory is pinned to its author's Auth0 sub, and
+    `_fetch_owned_memory` turns a scope miss into a 404 so the routes are not an id
+    oracle. Correct for personal memories, and fatal for the other kind: a
+    repo-wide code note whose URL is committed to version control 404'd for every
+    colleague who followed the link, including the ones the note was written for.
+    The author saw it working, which is why it survived.
+
+    A reserved `user_id` — not an unpinned admin, not a per-row ACL — is the whole
+    mechanism, so these assert on the exact set membership.
+    """
+
+    SHARED = "repo:ai-utils"
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    BOB = MemoryScope(pinned_user_id="auth0:bob", is_admin=False)
+
+    def test_a_second_identity_can_read_a_shared_row(self) -> None:
+        """The property the whole change exists for."""
+        self.assertTrue(self.BOB.owns(self.SHARED))
+
+    def test_the_author_still_reads_their_own_shared_row(self) -> None:
+        self.assertTrue(self.ALICE.owns(self.SHARED))
+
+    def test_sharing_does_not_open_anyone_elses_personal_scope(self) -> None:
+        """The widening is one enumerated value, not "any scope that is not mine"."""
+        self.assertFalse(self.BOB.owns("auth0:alice"))
+
+    def test_a_lookalike_scope_is_not_shared(self) -> None:
+        """Membership is exact, never a `repo:` prefix test. A prefix rule would be
+        the entire check on this path and would accept anything shaped like it."""
+        for lookalike in ("repo:ai-utils-2", "repo:", "repo:ai_utils", "ai-utils"):
+            with self.subTest(user_id=lookalike):
+                self.assertFalse(self.BOB.owns(lookalike))
+
+    def test_unscoped_rows_are_still_unreachable(self) -> None:
+        """Pre-pinning rows carry `user_id = None`. Sharing must not sweep them in —
+        they were written before anyone chose to publish anything."""
+        self.assertFalse(self.BOB.owns(None))
+
+
+class SharedRowsAreWriteAttributedTest(unittest.TestCase):
+    """The write half: read shared, write attributed. Never a blanket unpin.
+
+    Widening `owns` alone would have been a strictly worse hole than the one being
+    fixed — every authenticated caller would have gained edit and delete rights
+    over every repo-wide note. `may_modify` is the second predicate that stops it,
+    and every mutating route must call it instead of `owns`.
+    """
+
+    SHARED = "repo:ai-utils"
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    BOB = MemoryScope(pinned_user_id="auth0:bob", is_admin=False)
+    ADMIN = MemoryScope(pinned_user_id="auth0:carol", is_admin=True)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+
+    def test_a_second_identity_cannot_overwrite_a_row_it_did_not_author(self) -> None:
+        """Reading it is the point; rewriting it is not."""
+        self.assertTrue(self.BOB.owns(self.SHARED), "precondition: bob must be able to READ it")
+        self.assertFalse(self.BOB.may_modify(self.SHARED, "auth0:alice"))
+
+    def test_the_author_may_still_change_their_own_shared_row(self) -> None:
+        self.assertTrue(self.ALICE.may_modify(self.SHARED, "auth0:alice"))
+
+    def test_an_sso_admin_may_moderate_a_shared_row(self) -> None:
+        """Deliberately different from `delete_all_memories`, where admin-ness does
+        NOT let you destroy a colleague's memories. Consistent on the principle: a
+        shared row is repo-wide by construction and sits in nobody's private scope."""
+        self.assertTrue(self.ADMIN.may_modify(self.SHARED, "auth0:alice"))
+
+    def test_an_admin_still_cannot_touch_a_colleagues_personal_row(self) -> None:
+        """The admin exception is scoped to shared rows and nothing else. If this
+        goes green-to-red the admin branch has escaped past `owns`."""
+        self.assertFalse(self.ADMIN.may_modify("auth0:alice", None))
+        self.assertFalse(self.ADMIN.may_modify("auth0:alice", "auth0:carol"))
+
+    def test_a_shared_row_with_no_author_fails_closed(self) -> None:
+        """Rows predating attribution, or ones whose `author_sub` was stripped in the
+        store, are admin-only — not everyone-writable. Reading the author rather
+        than merely checking one exists is exactly what buys this."""
+        self.assertFalse(self.BOB.may_modify(self.SHARED, None))
+        self.assertTrue(self.ADMIN.may_modify(self.SHARED, None))
+
+    def test_a_forged_author_on_a_personal_row_buys_nothing(self) -> None:
+        """`author_sub` is consulted only after `owns` has already passed, so it can
+        never be the thing that grants access to someone else's private scope."""
+        self.assertFalse(self.BOB.may_modify("auth0:alice", "auth0:bob"))
+
+    def test_a_pinned_caller_still_owns_their_own_personal_rows(self) -> None:
+        """The narrowing applies to shared rows only; nothing about a private row
+        changed, and it has no `author_sub` to check."""
+        self.assertTrue(self.ALICE.may_modify("auth0:alice", None))
+
+    def test_legacy_credentials_keep_their_pre_existing_freedom(self) -> None:
+        """X-API-Key / ADMIN_API_KEY / AUTH_DISABLED are unpinned by design, and
+        operational cleanup of shared rows runs through the machine credential."""
+        self.assertTrue(self.UNPINNED.may_modify(self.SHARED, "auth0:alice"))
+        self.assertTrue(self.UNPINNED.may_modify("auth0:alice", None))
+
+
+class SharedWriteOptInTest(unittest.TestCase):
+    """`metadata.scope` is how a write opts into a shared scope, and the only way.
+
+    It travels in METADATA rather than as a `user_id` argument because
+    `tools/mcp/mem0/scripts/assemble-spec.ts` strips `user_id`/`agent_id`/`run_id`
+    from every generated MCP tool schema AND from request-body properties — an MCP
+    caller cannot name a `user_id` at all. Metadata passes through verbatim, so the
+    OpenAPI spec and the gateway's `include_tools` allowlist stay untouched.
+
+    Which makes this the one place a caller-supplied string decides where a row
+    lands. These pin the checks on it.
+    """
+
+    SHARED = "repo:ai-utils"
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+
+    def _opt_in(self, metadata: dict[str, object]) -> tuple[str, dict[str, object]]:
+        """`shared_write` returns None for an ordinary write, so every test that
+        expects an opt-in has to prove it got one before unpacking. Doing that here
+        rather than in each test keeps the None case a real assertion instead of a
+        TypeError that happens to fail."""
+        result = self.ALICE.shared_write(metadata)
+        self.assertIsNotNone(result, "expected the opt-in to be honoured")
+        assert result is not None  # narrows for the type checker
+        return result
+
+    def test_an_ordinary_write_is_left_alone(self) -> None:
+        self.assertIsNone(self.ALICE.shared_write(None))
+        self.assertIsNone(self.ALICE.shared_write({"name": "a-note"}))
+
+    def test_opting_in_redirects_the_row_and_stamps_the_author(self) -> None:
+        user_id, metadata = self._opt_in({"scope": self.SHARED, "name": "a-note"})
+        self.assertEqual(user_id, self.SHARED)
+        self.assertEqual(metadata["author_sub"], "auth0:alice")
+        self.assertEqual(metadata["name"], "a-note", "the caller's own metadata must survive")
+
+    def test_the_body_can_never_supply_its_own_author(self) -> None:
+        """`author_sub` gates every later write to the row. Merging it from the
+        request body instead of overwriting would let a caller publish a note
+        already attributed to somebody else, or one only they could ever edit."""
+        _, metadata = self._opt_in({"scope": self.SHARED, "author_sub": "auth0:bob"})
+        self.assertEqual(metadata["author_sub"], "auth0:alice")
+
+    def test_the_request_body_is_not_mutated(self) -> None:
+        """Same reason `add_memory` assigns into `params` and not into the model:
+        the body as sent is what the request log records."""
+        body = {"scope": self.SHARED, "name": "a-note"}
+        self.ALICE.shared_write(body)
+        self.assertEqual(body, {"scope": self.SHARED, "name": "a-note"})
+
+    def test_an_unknown_scope_is_refused_not_quietly_stored_privately(self) -> None:
+        """A typo'd `repo:aiutils` that returned 200 and produced a PRIVATE row is
+        the exact failure this change exists to fix — discovered weeks later, by a
+        colleague following a link."""
+        for typo in ("repo:aiutils", "repo:ai-utils ", "ai-utils", ""):
+            with self.subTest(scope=typo):
+                with self.assertRaises(HTTPException) as caught:
+                    self.ALICE.shared_write({"scope": typo})
+                self.assertEqual(caught.exception.status_code, 400)
+
+    def test_a_scope_naming_another_caller_is_refused(self) -> None:
+        """The exact-set test is what stops the opt-in being a write-anywhere
+        primitive: nothing here may ever land a row in a colleague's scope."""
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.shared_write({"scope": "auth0:bob"})
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_a_non_string_scope_is_a_400_and_not_a_500(self) -> None:
+        """A JSON body can carry a list or an object here, and `in` on a frozenset
+        raises TypeError for an unhashable value — which would surface as a 500 on a
+        merely malformed request."""
+        for malformed in ([self.SHARED], {"name": self.SHARED}, 7, True):
+            with self.subTest(scope=malformed):
+                with self.assertRaises(HTTPException) as caught:
+                    self.ALICE.shared_write({"scope": malformed})
+                self.assertEqual(caught.exception.status_code, 400)
+
+    def test_a_null_scope_is_a_400_and_not_a_silent_private_write(self) -> None:
+        """`null` is the one malformed value the old check could not see. It tested
+        `metadata.get(SHARED_SCOPE_KEY) is None`, which short-circuited BEFORE the
+        allowlist, so `{"scope": null}` stored a PRIVATE row carrying a useless
+        `scope: None` key and answered 200 — the same silent success as a typo'd
+        scope, reached through the shape a typo cannot produce. It is not exotic:
+        `null` is what a client library emits for an unset optional field, so it
+        arrives without anyone deciding to send it."""
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.shared_write({"scope": None})
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_the_key_being_absent_is_still_an_ordinary_write(self) -> None:
+        """The distinction the fix rests on is PRESENT-and-null versus ABSENT, and
+        collapsing it the other way would turn every private write into a 400."""
+        self.assertIsNone(self.ALICE.shared_write({"name": "a-note", "type": "reference"}))
+        self.assertIsNone(self.ALICE.shared_write({}))
+        self.assertIsNone(self.ALICE.shared_write(None))
+
+    def test_an_unpinned_caller_is_still_passed_through_on_a_null_scope(self) -> None:
+        """The unpinned check comes first for a reason: a machine credential sending
+        `{"scope": null}` must keep behaving exactly as it did, since it never opted
+        into any of this."""
+        self.assertIsNone(self.UNPINNED.shared_write({"scope": None}))
+
+    def test_an_unpinned_caller_is_passed_through_untouched(self) -> None:
+        """They can already name any `user_id` outright, so honouring the opt-in
+        would buy them nothing — and would mint a shared row with no author, one
+        nothing but the machine credential could ever edit again."""
+        self.assertIsNone(self.UNPINNED.shared_write({"scope": self.SHARED}))
+
+
+class UpdateCannotRewriteOwnershipTest(unittest.TestCase):
+    """`PUT /memories/{id}` must not be a second, unguarded way to re-key a row.
+
+    mem0's `_update_memory` does `new_metadata = deepcopy(existing.payload)` then
+    `new_metadata.update(metadata)`, and the payload is where `user_id` lives. So a
+    metadata dict naming `user_id` REWRITES the row's owner in place — which would
+    have made every check above decorative: publish by PUT with no scope validation
+    and no attribution, or forge the `author_sub` that gates the write path.
+
+    Loud rather than silent. Dropping the key quietly would let a caller believe
+    they had published a note repo-wide when they had not.
+
+    This half of the guard is ROW-INDEPENDENT and so runs before the `get` that
+    fetches the row is spent; `PutMetadataRoundTripTest` below covers the half that
+    needs the row in hand.
+    """
+
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+
+    def _assert_refused(self, metadata: dict) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.reject_ownership_metadata(metadata)
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_an_update_may_not_move_a_row_into_another_scope(self) -> None:
+        self._assert_refused({"user_id": "auth0:bob"})
+
+    def test_an_update_may_not_publish_a_row_by_naming_the_shared_user_id(self) -> None:
+        """`user_id` is what `owns` and `read_scopes` actually key on, so this is the
+        spelling that would really re-home the row — skipping `shared_write`'s scope
+        allowlist AND its attribution stamp, leaving an authorless shared row."""
+        self._assert_refused({"user_id": "repo:ai-utils"})
+
+    def test_ordinary_metadata_still_updates(self) -> None:
+        """The refusal is ONE key wide, not "metadata is now read-only"."""
+        self.ALICE.reject_ownership_metadata({"name": "a-note", "type": "reference"})
+        self.ALICE.reject_ownership_metadata(None)
+        self.ALICE.reject_ownership_metadata({})
+
+    def test_the_grouping_ids_are_not_refused_by_this_half(self) -> None:
+        """`agent_id`/`run_id` group rows, they do not own them, and the derived fact
+        layer writes them on every private row it creates. Whether they are allowed
+        depends on the row, which this half cannot see — `reject_row_metadata_conflicts`
+        is where a SHARED row refuses them."""
+        self.ALICE.reject_ownership_metadata({"agent_id": "facts", "run_id": "parent-id"})
+
+    def test_the_server_derived_keys_are_not_refused_by_this_half_either(self) -> None:
+        """They used to be, and it broke the documented round trip — see
+        `PutMetadataRoundTripTest`. Whether they are acceptable depends on what the
+        row already stores, so the answer moved to the row-aware guard."""
+        self.ALICE.reject_ownership_metadata({"scope": "repo:ai-utils", "author_sub": "auth0:alice"})
+
+    def test_legacy_credentials_are_not_held_to_it(self) -> None:
+        """They are unscoped everywhere else in this class, and re-keying a row is
+        inside what they could already do by deleting and re-adding it."""
+        self.UNPINNED.reject_ownership_metadata({"user_id": "auth0:bob"})
+
+
+class PutMetadataRoundTripTest(unittest.TestCase):
+    """A `PUT` may ECHO the server-derived keys back; it may not CHANGE them.
+
+    WHY THIS EXISTS. `scope` and `author_sub` were a flat 400 on any `PUT`, and that
+    broke the workflow the deployment documents. mem0's `Memory.get()` promotes only
+    the entity ids and buckets every other payload key into `metadata`, so BOTH come
+    back inside `metadata` on a read — and the recorded instruction is "search first
+    and update the existing row rather than adding a near-duplicate", i.e. GET, edit,
+    PUT what you read. A shared row's own author therefore could not update their own
+    note without knowing to strip two keys the error never mentioned, and the 400 read
+    like a permission problem rather than a payload one.
+
+    Comparing against the stored row is what makes the round trip lossless while
+    keeping a real ownership change loud. Re-deriving them silently was the other
+    option and is the same class of plausible-looking success as a typo'd scope.
+    """
+
+    SHARED = "repo:ai-utils"
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+    #: What `Memory.get()` hands back for a shared row Alice wrote.
+    STORED = {"scope": SHARED, "author_sub": "auth0:alice", "name": "a-note"}
+
+    def _assert_refused(self, metadata: dict, stored_user_id: str | None, stored: dict | None) -> None:
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.reject_row_metadata_conflicts(metadata, stored_user_id, stored)
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_putting_back_exactly_what_get_returned_is_allowed(self) -> None:
+        """The property the whole change exists for: GET, edit the prose, PUT."""
+        self.ALICE.reject_row_metadata_conflicts(dict(self.STORED), self.SHARED, self.STORED)
+
+    def test_editing_ordinary_metadata_in_the_round_trip_is_allowed(self) -> None:
+        edited = {**self.STORED, "name": "a-renamed-note"}
+        self.ALICE.reject_row_metadata_conflicts(edited, self.SHARED, self.STORED)
+
+    def test_omitting_the_derived_keys_entirely_is_allowed(self) -> None:
+        """mem0 deep-copies the existing payload before updating, so keys the body
+        does not mention survive. Nothing has to be echoed for the row to stay
+        correct — echoing is merely permitted."""
+        self.ALICE.reject_row_metadata_conflicts({"name": "a-note"}, self.SHARED, self.STORED)
+
+    def test_changing_the_scope_is_still_refused(self) -> None:
+        """Changing `scope` alone cannot re-home a row on its own — `owns` and
+        `read_scopes` read the payload's `user_id`, which `reject_ownership_metadata`
+        refuses outright. But a row whose metadata CLAIMS a scope it does not have is
+        exactly the plausible-looking lie the opt-in's 400 exists to prevent, and it
+        is the second door on the shared-grouping forgery."""
+        self._assert_refused({"scope": self.SHARED}, "auth0:alice", {})
+        self._assert_refused({"scope": "repo:something-else"}, self.SHARED, self.STORED)
+        self._assert_refused({"scope": None}, self.SHARED, self.STORED)
+
+    def test_changing_the_attribution_is_still_refused(self) -> None:
+        """`author_sub` is what `may_modify` reads to decide who may change a shared
+        row. A caller who can rewrite it can hand their own note to somebody else, or
+        keep one nobody but the machine credential could ever edit."""
+        self._assert_refused({"author_sub": "auth0:bob"}, self.SHARED, self.STORED)
+        self._assert_refused({"author_sub": "auth0:alice"}, "auth0:alice", {})
+
+    def test_the_refusal_says_which_key_did_not_match(self) -> None:
+        """The 400 this replaces said only that the keys were forbidden, which sent
+        the author looking for a permission they did not lack. Naming the mismatch is
+        the whole difference between "you may not do this" and "your body disagrees
+        with the row"."""
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.reject_row_metadata_conflicts({"author_sub": "auth0:bob"}, self.SHARED, self.STORED)
+        self.assertIn("do not match the stored memory: author_sub", caught.exception.detail)
+
+    def test_legacy_credentials_are_not_held_to_it(self) -> None:
+        """Unscoped everywhere else in this class; `build_fact_layer.py` rewrites
+        whatever it likes through the machine credential."""
+        self.UNPINNED.reject_row_metadata_conflicts({"author_sub": "auth0:bob"}, self.SHARED, self.STORED)
+
+
+class SharedRowsCannotBeGroupedIntoAnothersFactsTest(unittest.TestCase):
+    """A pinned caller may not choose the grouping ids on a SHARED row.
+
+    THE FORGERY. `agent_id`/`run_id` are grouping and not ownership, which holds
+    right up until the row is shared. The console's memory page resolves a row's
+    derived facts with `post_search filters={"run_id": <that memory's id>}` and
+    `include_shared` (`tools/web/console/src/lib/mem0/api.ts`, `factsFor`), so a
+    SHARED row carrying `agent_id: "facts"` and `run_id: <Alice's memory id>` renders
+    as a fact extracted from Alice's memory. Bob may write exactly that: the
+    `metadata.scope` opt-in is open to everyone and he authors the row, so
+    `may_modify` keeps letting him edit it afterwards. Because the fact layer is what
+    recall retrieves, that is an injection path into a colleague's agent context, not
+    merely a wrong-looking page.
+
+    TWO ROUTES, two guards, and both are needed: refusing it only on `POST` leaves
+    "publish an empty shared row, then PUT the ids into it", one extra request.
+    """
+
+    SHARED = "repo:ai-utils"
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    ADMIN = MemoryScope(pinned_user_id="auth0:carol", is_admin=True)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+
+    def _assert_post_refused(self, agent_id=None, run_id=None, metadata=None) -> HTTPException:
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.reject_shared_grouping_ids(agent_id, run_id, metadata)
+        self.assertEqual(caught.exception.status_code, 400)
+        return caught.exception
+
+    def test_a_shared_post_may_not_name_a_run_id(self) -> None:
+        self._assert_post_refused(run_id="alices-memory-id")
+
+    def test_a_shared_post_may_not_name_an_agent_id(self) -> None:
+        self._assert_post_refused(agent_id="facts")
+
+    def test_the_metadata_carrier_is_refused_too_and_it_is_not_the_same_one(self) -> None:
+        """mem0's `_build_filters_and_metadata` does `deepcopy(input_metadata)` and
+        only THEN `base_metadata_template["agent_id"] = agent_id`, under `if agent_id:`.
+        So a grouping id smuggled through `metadata` reaches the payload untouched
+        whenever the top-level parameter is absent — guarding the parameters alone
+        would have looked complete and stopped nothing."""
+        self._assert_post_refused(metadata={"scope": self.SHARED, "run_id": "alices-memory-id"})
+        self._assert_post_refused(metadata={"scope": self.SHARED, "agent_id": "facts"})
+
+    def test_the_refusal_names_the_key(self) -> None:
+        self.assertIn("run_id", self._assert_post_refused(run_id="alices-memory-id").detail)
+
+    def test_an_ordinary_shared_write_is_untouched(self) -> None:
+        """The refusal is two keys wide. A repo-wide note with a name and a type is
+        the whole point of the shared scope."""
+        self.ALICE.reject_shared_grouping_ids(None, None, {"scope": self.SHARED, "name": "a-note"})
+        self.ALICE.reject_shared_grouping_ids(None, None, None)
+
+    def test_the_put_route_refuses_the_same_thing_on_a_shared_row(self) -> None:
+        """Otherwise the POST refusal is bypassed by publishing an empty shared row
+        and then PUTting the grouping ids into it."""
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.reject_row_metadata_conflicts(
+                {"agent_id": "facts", "run_id": "alices-memory-id"}, self.SHARED, {"author_sub": "auth0:alice"}
+            )
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_an_sso_admin_is_not_exempt(self) -> None:
+        """`may_modify` lets an SSO admin moderate a shared row, which is about
+        removing or correcting common property. Re-pointing one at a colleague's
+        memory is not moderation, and the fact layer is built through the unpinned
+        machine credential anyway — so the admin carve-out stops here."""
+        with self.assertRaises(HTTPException):
+            self.ADMIN.reject_shared_grouping_ids("facts", "alices-memory-id", None)
+
+    def test_a_private_row_keeps_its_grouping_ids(self) -> None:
+        """The derived fact layer writes both on every private row it creates.
+        Refusing them there would break `build_fact_layer.py` for a pinned caller and
+        buy nothing: a private row is not reachable through anyone else's read."""
+        self.ALICE.reject_row_metadata_conflicts({"agent_id": "facts", "run_id": "parent-id"}, "auth0:alice", {})
+
+    def test_the_unpinned_fact_layer_build_is_untouched(self) -> None:
+        """`.claude/hooks/mem0/build_fact_layer.py` writes `agent_id` AND `run_id` on
+        every fact, through ADMIN_API_KEY. That credential is unpinned, so it must
+        never reach either guard — this is the check the fix was warned not to
+        break."""
+        self.UNPINNED.reject_shared_grouping_ids("facts", "parent-id", {"scope": self.SHARED})
+        self.UNPINNED.reject_row_metadata_conflicts(
+            {"agent_id": "facts", "run_id": "parent-id"}, self.SHARED, {"author_sub": "auth0:alice"}
+        )
+
+
+class SearchFiltersCannotOutrunThePinTest(unittest.TestCase):
+    """`POST /search` filters may only carry scalars for a pinned caller.
+
+    THE HOLE. `search_memories` pins with `{**caller_filters, "user_id": <caller>}`,
+    which looks final and is not. `{**d, k: v}` keeps the ORIGINAL position of a key
+    already in `d`, so a caller who writes `user_id` before `AND` controls the
+    iteration order of the merged dict; `Memory._process_metadata_filters` then
+    FLATTENS the `AND` group back to the top level through `merge_filters`, whose
+    scalar branch is a plain `target[key] = value`; and `search()` finishes with
+    `effective_filters.update(processed_filters)`. Net effect: the caller's
+    `user_id` lands back over the pin and the search runs against any other person's
+    private scope. `Mem0FlattensAndOverThePinTest` below EXECUTES that against the
+    installed wheel rather than asserting it from a reading of the source.
+
+    AN ALLOWLIST, NOT A LIST OF DANGEROUS OPERATORS. `OR`/`NOT` nest into
+    `$or`/`$not`, which pgvector joins with AND, so they do not escape TODAY.
+    `requirements.txt` pins `mem0ai>=0.1.48` — a floor — so the filter compiler is
+    not a fixed target, and a denylist over it would stop covering the moment a
+    release adds a fourth logical key, with nothing able to notice. The rule is
+    therefore about values, not keys: a container of any kind is refused.
+    """
+
+    ALICE = MemoryScope(pinned_user_id="auth0:alice", is_admin=False)
+    UNPINNED = MemoryScope(pinned_user_id=None, is_admin=False)
+    VICTIM = "auth0:bob"
+
+    def _assert_refused(self, filters: dict) -> HTTPException:
+        with self.assertRaises(HTTPException) as caught:
+            self.ALICE.reject_scope_escaping_filters(filters)
+        self.assertEqual(caught.exception.status_code, 400)
+        return caught.exception
+
+    def test_the_and_escape_is_refused_in_the_ordering_that_works(self) -> None:
+        """`user_id` first is the ordering that actually escapes."""
+        self._assert_refused({"user_id": "anything", "AND": [{"user_id": self.VICTIM}]})
+
+    def test_the_and_escape_is_refused_in_the_ordering_that_does_not(self) -> None:
+        """The other ordering is harmless with today's wheel, and the fix must not
+        depend on that — dict ordering is the attacker's to choose, and it is the one
+        input a caller controls that no filter-shape check can see."""
+        self._assert_refused({"AND": [{"user_id": self.VICTIM}], "user_id": "anything"})
+
+    def test_the_operators_that_are_currently_safe_are_refused_anyway(self) -> None:
+        """`OR`/`NOT`/`$or`/`$not` do not escape against the pinned floor of the
+        library. They are refused because "does not escape" is a property of a
+        version this server does not pin, not of the filter language."""
+        for key in ("OR", "NOT", "$and", "$or", "$not"):
+            with self.subTest(operator=key):
+                self._assert_refused({key: [{"user_id": self.VICTIM}]})
+
+    def test_a_comparison_operator_dict_is_refused(self) -> None:
+        """`{"k": {"eq": ...}}` is what flips mem0 into advanced-filter processing at
+        all, which is the code path the escape lives on."""
+        self._assert_refused({"metadata_key": {"eq": "x"}})
+
+    def test_a_null_value_is_refused_rather_than_waved_through(self) -> None:
+        """`{"k": null}` compiles to `payload->>'k' = 'None'` — a filter matching no
+        row, returning 200 with an empty list. Not an escape; the other failure this
+        module keeps closing, where the answer is wrong and nothing says so."""
+        self._assert_refused({"name": None})
+
+    def test_the_refusal_names_the_offending_key(self) -> None:
+        detail = self._assert_refused({"AND": [{"user_id": self.VICTIM}]}).detail
+        self.assertIn("AND", detail)
+
+    def test_the_filters_every_real_caller_sends_still_work(self) -> None:
+        """The console's fact panel (`filters={"run_id": <parent id>}`), its layer
+        scoping and `.claude/hooks/mem0/` recall (`{"agent_id": "facts"}`). If this
+        goes red the guard has been widened past what it is for."""
+        for filters in (
+            {"agent_id": "facts"},
+            {"run_id": "parent-id"},
+            {"agent_id": "facts", "run_id": "parent-id"},
+            {"variant": "fact", "source_profile": "max"},
+            {"agent_id": "*"},
+            None,
+            {},
+        ):
+            with self.subTest(filters=filters):
+                self.ALICE.reject_scope_escaping_filters(filters)
+
+    def test_a_caller_supplied_user_id_is_exempt_because_the_pin_overwrites_it(self) -> None:
+        """`pin` overwriting a caller-supplied `user_id` is documented and tested
+        behaviour, and the route applies it one line later. Rejecting it here would
+        break the deprecated top-level `user_id` field, which `search_memories`
+        copies into `filters` before pinning."""
+        self.ALICE.reject_scope_escaping_filters({"user_id": self.VICTIM})
+        self.ALICE.reject_scope_escaping_filters({"user_id": {"eq": self.VICTIM}})
+
+    def test_unpinned_callers_keep_the_full_filter_language(self) -> None:
+        """They can already name any `user_id` outright, so there is no pin to
+        escape — and CI, `mem0ctl.py` under the machine credential and the console's
+        admin paths all run through them."""
+        self.UNPINNED.reject_scope_escaping_filters({"AND": [{"user_id": self.VICTIM}]})
+
+
+class Mem0FlattensAndOverThePinTest(unittest.TestCase):
+    """The library behaviour that makes the guard above necessary, EXECUTED.
+
+    Every other test in this file compares this server against its own intent. This
+    one runs the INSTALLED `mem0ai` wheel — the copy that actually serves requests;
+    the image installs from PyPI, so `mem0/` in this fork is an upstream contribution
+    that reaches production no sooner than the next release — and reproduces the
+    escape end to end. It is the difference between "the source reads as though an
+    `AND` group overwrites the pin" and "it does".
+
+    Still no network and no database: `_process_metadata_filters` touches no `self`,
+    so it is called unbound. Constructing a `Memory` is what would need credentials,
+    and nothing here does.
+
+    IF THIS GOES RED, read it before touching anything. A failure means the wheel's
+    filter semantics moved, which is not itself bad news — upstream may have fixed
+    the overwrite. It is NOT on its own a reason to delete
+    `reject_scope_escaping_filters`: the guard is an allowlist precisely because
+    `requirements.txt` pins a floor rather than a version, so an older wheel with the
+    old behaviour remains installable. Update the test to describe what the wheel now
+    does, and leave the guard.
+    """
+
+    PINNED = "auth0:alice"
+    VICTIM = "auth0:bob"
+
+    @classmethod
+    def _effective(cls, caller_filters: dict) -> dict:
+        """main.py's own pin, then `Memory.search`'s advanced-operator branch, verbatim.
+
+        Transcribed rather than called, because main.py builds a real `Memory` at
+        import scope and `Memory.search` would run an embedder and a query. What is
+        reproduced is `search_memories`'s `{**filters, "user_id": sid}` followed by
+        the six lines of `Memory.search` that sit between `_has_advanced_operators`
+        and `_search_vector_store` — including the pops, so that the dict this
+        returns is the one the vector store would receive.
+        `RoutesCallTheRightGuardTest` in test_list_scoping.py is what pins that the
+        route still contains the first of those lines.
+        """
+        pinned = {**caller_filters, "user_id": cls.PINNED}
+        processed = mem0_main.Memory._process_metadata_filters(None, pinned)
+        for logical_key in ("AND", "OR", "NOT"):
+            pinned.pop(logical_key, None)
+        for key in list(pinned):
+            if key not in ("AND", "OR", "NOT", "user_id", "agent_id", "run_id") and isinstance(pinned.get(key), dict):
+                pinned.pop(key, None)
+        pinned.update(processed)
+        return pinned
+
+    def test_the_wheel_still_has_the_method_this_rests_on(self) -> None:
+        """A rename would make every assertion below an AttributeError with no
+        indication of which side changed."""
+        self.assertTrue(hasattr(mem0_main.Memory, "_process_metadata_filters"))
+
+    def test_an_and_group_overwrites_the_pin_when_user_id_comes_first(self) -> None:
+        """The escape. `merge_filters`' scalar branch is `target[key] = value`, so
+        flattening `AND` back to the top level is an overwrite, not a conjunction."""
+        escaped = self._effective({"user_id": "anything", "AND": [{"user_id": self.VICTIM}]})
+        self.assertEqual(
+            escaped["user_id"],
+            self.VICTIM,
+            "the pin held — the wheel's filter semantics have changed; read this class's docstring",
+        )
+
+    def test_the_same_payload_with_the_keys_reversed_does_not_escape(self) -> None:
+        """Which is why no fix may depend on key order: `{**d, k: v}` keeps the
+        ORIGINAL position of a key already in `d`, and that position is the
+        attacker's to choose."""
+        held = self._effective({"AND": [{"user_id": self.VICTIM}], "user_id": "anything"})
+        self.assertEqual(held["user_id"], self.PINNED)
+
+    def test_or_and_not_nest_instead_of_flattening(self) -> None:
+        """The reason the guard is an allowlist rather than a list of operators: these
+        two are safe by an implementation detail of a version this server does not
+        pin (they become `$or`/`$not`, which pgvector joins with AND), not by
+        anything in the filter language's contract."""
+        for operator, compiled in (("OR", "$or"), ("NOT", "$not")):
+            with self.subTest(operator=operator):
+                nested = self._effective({operator: [{"user_id": self.VICTIM}]})
+                self.assertEqual(nested["user_id"], self.PINNED)
+                self.assertIn(compiled, nested)
+
+    def test_the_guard_refuses_every_payload_above(self) -> None:
+        """The two halves joined up: what the library does, and what now never
+        reaches it."""
+        for payload in (
+            {"user_id": "anything", "AND": [{"user_id": self.VICTIM}]},
+            {"AND": [{"user_id": self.VICTIM}], "user_id": "anything"},
+            {"OR": [{"user_id": self.VICTIM}]},
+            {"NOT": [{"user_id": self.VICTIM}]},
+        ):
+            with self.subTest(filters=payload):
+                with self.assertRaises(HTTPException) as caught:
+                    MemoryScope(pinned_user_id=self.PINNED, is_admin=False).reject_scope_escaping_filters(payload)
+                self.assertEqual(caught.exception.status_code, 400)
 
 
 class AdoptionClosesThePasswordDoorTest(unittest.TestCase):

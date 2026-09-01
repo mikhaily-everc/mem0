@@ -4,12 +4,14 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from auth0 import Auth0Claims, Auth0VerificationError, looks_like_auth0_token, verify_auth0_token
 from db import get_db
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
+from listing import SHARED_SCOPES
 from models import APIKey, RefreshTokenJti, User
 from passlib.context import CryptContext
 from sqlalchemy import select, update
@@ -392,7 +394,62 @@ async def require_admin(
 # `request.state`. A route that needs scoping and forgets to ask for it is then a
 # visible omission in its signature, which is reviewable; an implicit lookup that
 # silently returns "unscoped" is exactly how the original hole survived.
+#
+# The one crack deliberately left in that wall is the SHARED scope, below: pinning
+# also made a memory's URL useless to anyone but its author, so a repo-wide code
+# note committed to version control 404s for every colleague who follows the link.
+# The crack is read-only and its width is one enumerated set of `user_id` values —
+# read shared, write attributed, never a blanket unpin.
 # ---------------------------------------------------------------------------
+
+#: Metadata key a writer sets to opt a row into a shared scope, and the key the
+#: server stamps their verified subject onto in return. Both are ordinary payload
+#: keys once stored — mem0 flattens `metadata` into the row's payload — so they are
+#: readable back through `Memory.get()`'s `metadata` dict and filterable in a query.
+SHARED_SCOPE_KEY = "scope"
+AUTHOR_SUB_KEY = "author_sub"
+
+#: Metadata keys a pinned caller may never write through `PUT /memories/{id}`,
+#: whatever the row says.
+#: mem0's `_update_memory` does `new_metadata = deepcopy(existing.payload)` then
+#: `new_metadata.update(metadata)`, so a metadata dict naming `user_id` OVERWRITES
+#: the row's identity in place: it re-keys the row into another caller's scope, or
+#: into the shared one, bypassing the `POST /memories` opt-in entirely. There is no
+#: legitimate spelling of that, from any caller, on any row — hence a flat refusal
+#: rather than a comparison against what is stored.
+OWNERSHIP_METADATA_KEYS = ("user_id",)
+
+#: Metadata keys the SERVER derives, which a `PUT` may ECHO BACK but never CHANGE.
+#:
+#: These two used to sit in `OWNERSHIP_METADATA_KEYS`, i.e. naming either in a `PUT`
+#: was a flat 400 — and that broke the documented round trip. mem0's `Memory.get()`
+#: returns BOTH inside `metadata` (it promotes only the entity ids and buckets every
+#: other payload key there), and the recorded workflow is "search first and update
+#: the existing row rather than adding a near-duplicate": GET, edit, PUT what you
+#: read. So a shared row's own author could not update it without knowing to strip
+#: two keys the error message never mentioned, and the 400 read like a permission
+#: problem rather than a payload one.
+#:
+#: `reject_row_metadata_conflicts` compares them against the stored row instead —
+#: equal is a no-op and passes, different is still a 400. Silently dropping them was
+#: the other option, and a request that quietly means something other than what it
+#: says is the failure shape this file keeps getting bitten by.
+DERIVED_METADATA_KEYS = (SHARED_SCOPE_KEY, AUTHOR_SUB_KEY)
+
+#: Metadata keys that GROUP rows rather than own them.
+#:
+#: Free on a private row, and deliberately so: `.claude/hooks/mem0/build_fact_layer.py`
+#: writes both on every fact it derives. They stop being mere grouping on a SHARED
+#: row, where they become a forgery primitive aimed at somebody else's context — see
+#: `reject_shared_grouping_ids`, which refuses them there for a pinned caller only,
+#: leaving the unpinned fact-layer build untouched.
+GROUPING_METADATA_KEYS = ("agent_id", "run_id")
+
+#: The JSON scalars a pinned caller's `/search` filters may carry. `bool` is a
+#: subclass of `int` and so redundant here; it is spelled out because the set is the
+#: whole security argument of `reject_scope_escaping_filters` and a reader should not
+#: have to know that to see that booleans are allowed.
+FILTER_SCALAR_TYPES = (str, int, float, bool)
 
 
 @dataclass(frozen=True)
@@ -403,6 +460,24 @@ class MemoryScope:
     paths (native HS256 JWT, `X-API-Key`, `ADMIN_API_KEY`, `AUTH_DISABLED`) keep
     the pre-existing caller-supplied behaviour so agents and CI do not break; see
     the `X-API-Key` note in the deployment docs.
+
+    Three predicates, and they are NOT interchangeable — picking the wrong one is
+    how a read-only widening turns into a write-anywhere one:
+
+    * `owns`     — may READ this row. True for the shared scopes.
+    * `may_modify` — may OVERWRITE or DELETE it. Shared rows: author or admin only.
+    * `shared_write` — resolves a write's `metadata.scope` opt-in, and stamps the
+      attribution `may_modify` will later read back.
+
+    Plus four refusals, which exist because the predicates above answer questions
+    about a row that is ALREADY in the store, and every one of these is about a
+    request that has not reached it yet:
+
+    * `reject_scope_escaping_filters` — a `/search` filter that could outrun the pin.
+    * `reject_ownership_metadata`     — a `PUT` re-keying the row's `user_id`.
+    * `reject_row_metadata_conflicts` — a `PUT` changing what the server derived,
+      or grouping a shared row into somebody else's fact layer.
+    * `reject_shared_grouping_ids`    — the same forgery on the `POST` path.
     """
 
     pinned_user_id: str | None
@@ -417,15 +492,338 @@ class MemoryScope:
         return self.pinned_user_id if self.is_pinned else requested
 
     def owns(self, stored_user_id: str | None) -> bool:
-        """Whether a stored memory belongs to this caller.
+        """Whether this caller may READ a stored memory. Not the write predicate.
 
-        Unpinned callers retain full access. A pinned caller matches only their own
-        scope — note a stored `None` never matches, so pre-existing unscoped
-        memories become unreachable rather than shared.
+        Unpinned callers retain full access. A pinned caller matches their own
+        scope, plus the reserved shared scopes — note a stored `None` still never
+        matches, so pre-existing unscoped memories stay unreachable rather than
+        quietly becoming everyone's.
+
+        Reading a shared row is the entire point of the shared scope: a memory URL
+        in a committed file has to resolve for the colleague who follows it, and
+        before this it 404'd for everyone but the author. It says nothing about
+        writing — `may_modify` is the check for that, and every mutating route must
+        use it instead of this one.
         """
         if not self.is_pinned:
             return True
+        if stored_user_id in SHARED_SCOPES:
+            return True
         return stored_user_id == self.pinned_user_id
+
+    def may_modify(self, stored_user_id: str | None, author_sub: str | None) -> bool:
+        """Whether this caller may OVERWRITE or DELETE a stored memory.
+
+        Strictly narrower than `owns`. Everyone reads a shared row; only the
+        identity that wrote it — recorded as `metadata.author_sub` at creation from
+        the verified credential, never from the request body — may change or remove
+        it. Without this split, widening `owns` alone would have handed every
+        authenticated caller edit rights over every repo-wide note, which is a
+        strictly worse hole than the one the shared scope exists to fix.
+
+        An SSO admin IS allowed through here, and that is a deliberate departure
+        from `delete_all_memories`, where admin-ness explicitly does not let you
+        destroy a colleague's memories. The two are consistent on the principle: a
+        shared row is repo-wide by construction and belongs to no colleague's
+        private scope, so an admin acting on one is moderating common property, not
+        reaching into someone's account. Nothing here lets an admin touch a
+        PERSONAL row of another caller — `owns` fails first.
+
+        A shared row whose `author_sub` is missing (written before this existed, or
+        stripped by hand in the store) is admin-only, not everyone-writable. Failing
+        closed on absent attribution is the whole reason the check reads the author
+        rather than merely checking that one exists.
+        """
+        if not self.owns(stored_user_id):
+            return False
+        if stored_user_id not in SHARED_SCOPES:
+            return True
+        if not self.is_pinned:
+            # Legacy credentials (X-API-Key, ADMIN_API_KEY, AUTH_DISABLED) keep the
+            # pre-existing unrestricted behaviour deliberately; operational cleanup
+            # of shared rows runs through the machine credential.
+            return True
+        return self.is_admin or author_sub == self.pinned_user_id
+
+    def shared_write(self, metadata: dict[str, Any] | None) -> tuple[str, dict[str, Any]] | None:
+        """Resolve a `metadata.scope` opt-in into the (user_id, metadata) to store.
+
+        Returns None for an ordinary write, leaving the caller's own pinned scope
+        in force.
+
+        The opt-in travels in METADATA and not in a `user_id` argument, which looks
+        like an odd choice until you read `tools/mcp/mem0/scripts/assemble-spec.ts`:
+        it strips `user_id`/`agent_id`/`run_id` from every generated MCP tool schema
+        AND from request-body properties, so an MCP caller has no way to name a
+        `user_id` at all. Metadata passes through verbatim. Routing the opt-in
+        through it keeps the OpenAPI spec and the gateway's `include_tools`
+        allowlist untouched.
+
+        Membership is tested against the enumerated set, never by prefix. A
+        `startswith("repo:")` test would be the whole security check on this path,
+        and it would accept `auth0:someone-else` the moment the shape changed; an
+        exact set cannot be talked into writing into a colleague's scope.
+
+        An unrecognised value is a 400 rather than ordinary metadata. A typo'd
+        `repo:aiutils` that silently produced a PRIVATE row is the exact failure
+        this whole change exists to fix, arriving as a 200 and discovered only when
+        a colleague follows the URL.
+
+        Unpinned callers are passed through untouched: they can already name any
+        `user_id` outright, so honouring the opt-in would buy them nothing and would
+        mint a shared row with no author — one nothing but the machine credential
+        could ever edit again.
+
+        The test is "is the key PRESENT", not "is its value non-null", and the
+        difference is a whole failure mode of its own. `metadata.get(...) is None`
+        short-circuited BEFORE the allowlist ran, so `{"scope": null}` stored a
+        PRIVATE row carrying a useless `scope: None` key and answered 200 — the exact
+        silent success the 400 two paragraphs up exists to prevent, reached through
+        the one input shape a typo'd string cannot produce. `null` is what a client
+        library emits for an unset optional field, so it arrives without anyone
+        having decided to send it, and it is now a 400 like every other value that
+        is not a known scope.
+        """
+        metadata = metadata or {}
+        if not self.is_pinned or SHARED_SCOPE_KEY not in metadata:
+            return None
+        requested = metadata[SHARED_SCOPE_KEY]
+        # `in` on a frozenset raises TypeError for an unhashable value, and a JSON
+        # body can carry a list or an object here — that would be a 500 on a
+        # malformed request.
+        if not isinstance(requested, str) or requested not in SHARED_SCOPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown metadata.{SHARED_SCOPE_KEY}. Shared scopes are: " + ", ".join(sorted(SHARED_SCOPES)),
+            )
+        stored = dict(metadata)
+        # Overwritten, never merged from the body: attribution is what gates every
+        # later write to this row, so it may only ever come from the verified
+        # credential.
+        stored[AUTHOR_SUB_KEY] = self.pinned_user_id
+        return requested, stored
+
+    def reject_shared_grouping_ids(
+        self,
+        agent_id: str | None,
+        run_id: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        """Refuse a pinned caller's attempt to file a SHARED write into another person's group.
+
+        `agent_id`/`run_id` are grouping and not ownership — true right up until the
+        row is shared, at which point they are a fact-forgery primitive that lands
+        inside a colleague's agent context:
+
+        the console's memory page resolves a row's derived facts with
+        `post_search filters={"run_id": <that memory's id>}` plus `include_shared`
+        (`tools/web/console/src/lib/mem0/api.ts`, `factsFor`). So any SHARED row
+        carrying `agent_id: "facts"` and `run_id: <Alice's memory id>` renders as a
+        fact extracted from Alice's memory. Bob may write it — `metadata.scope` is an
+        open opt-in and he authors the row, so `may_modify` keeps letting him edit
+        it — and the fact layer is what recall retrieves, which makes this an
+        injection path into someone else's context rather than merely a wrong-looking
+        page.
+
+        BOTH carriers are refused, and they are NOT equivalent. mem0's
+        `_build_filters_and_metadata` does `base_metadata_template =
+        deepcopy(input_metadata)` and only THEN `base_metadata_template["agent_id"] =
+        agent_id`, under `if agent_id:` — so a grouping id smuggled through
+        `metadata` lands in the payload untouched whenever the top-level parameter is
+        absent. Guarding only the parameters would have looked complete and stopped
+        nothing.
+
+        A refusal rather than a cross-check against "a row this writer may modify",
+        because nothing in this deployment writes a shared row with grouping ids at
+        all: `.claude/hooks/mem0/build_fact_layer.py` writes both legitimately but
+        goes through ADMIN_API_KEY, which is UNPINNED and so never reaches this
+        check, and an MCP caller cannot name them at all (`assemble-spec.ts` strips
+        all three entity ids from every generated tool schema). So this costs a real
+        caller nothing today, and a 400 naming the key is recoverable where a
+        silently re-homed row is not.
+
+        The `POST` half. `PUT` is `reject_row_metadata_conflicts`, and BOTH are
+        required: this one alone leaves "publish an empty shared row, then PUT the
+        grouping ids into it".
+        """
+        if not self.is_pinned:
+            return
+        # Keyed BY NAME rather than zipped against the constant: a zip would make the
+        # mapping depend on `GROUPING_METADATA_KEYS`' order, and reordering a tuple of
+        # two strings is exactly the kind of edit nothing would flag.
+        supplied = {"agent_id": agent_id, "run_id": run_id}
+        named = [key for key in GROUPING_METADATA_KEYS if key in (metadata or {}) or supplied.get(key)]
+        if named:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"A write opting into metadata.{SHARED_SCOPE_KEY} may not set "
+                    + ", ".join(named)
+                    + ". Grouping ids on a shared row are server-controlled, because they decide "
+                    "whose memory the row is presented as belonging to."
+                ),
+            )
+
+    def reject_ownership_metadata(self, metadata: dict[str, Any] | None) -> None:
+        """Refuse a `PUT` whose metadata would rewrite who owns the row.
+
+        Loud rather than silent: quietly dropping the key would let a caller believe
+        they had published a note repo-wide when they had not, which is the same
+        class of plausible-looking success as the typo'd scope above.
+
+        Only pinned callers are held to it. The legacy credential paths are
+        deliberately unscoped everywhere else in this class and re-keying a row is
+        within what they could already do by deleting and re-adding it.
+
+        Deliberately row-INDEPENDENT, so it can run before the `get` that fetches the
+        row is spent. `user_id` is the one key with no legitimate spelling from any
+        pinned caller on any row; everything that needs to know what the row already
+        says is in `reject_row_metadata_conflicts`.
+        """
+        if not self.is_pinned or not metadata:
+            return
+        offending = [key for key in OWNERSHIP_METADATA_KEYS if key in metadata]
+        if offending:
+            raise HTTPException(
+                status_code=400,
+                detail="metadata may not set " + ", ".join(offending) + " on an existing memory.",
+            )
+
+    def reject_row_metadata_conflicts(
+        self,
+        metadata: dict[str, Any] | None,
+        stored_user_id: str | None,
+        stored_metadata: dict[str, Any] | None,
+    ) -> None:
+        """The half of the `PUT` guard that needs the stored row in hand.
+
+        Runs AFTER `_fetch_writable_memory` rather than beside
+        `reject_ownership_metadata`, because both of its properties are comparisons
+        against what the row already says:
+
+        1. `scope` and `author_sub` may be ECHOED BACK, never CHANGED. mem0's
+           `Memory.get()` returns both inside `metadata`, and the recorded workflow
+           is GET, edit, PUT what you read — so a flat refusal locked a shared row's
+           own author out of updating it. Equal to the stored value is a no-op and
+           passes; anything else is still a 400. Note that changing `scope` alone
+           could not by itself re-home a row — `owns` and `read_scopes` key on the
+           payload's `user_id`, which `reject_ownership_metadata` still refuses
+           outright — but a row whose metadata CLAIMS a shared scope it does not have
+           is precisely the plausible-looking lie the opt-in's 400 exists to prevent,
+           and it is the second door on the forgery in (2).
+
+        2. A pinned caller may not add or change a grouping id on a SHARED row, for
+           the reason spelled out in `reject_shared_grouping_ids`: `run_id` is what
+           decides whose memory a fact is presented as belonging to. Without this,
+           the `POST`-side refusal is bypassed by publishing an empty shared row and
+           then PUTting the ids into it — one extra request.
+
+        Private rows are untouched by (2). The fact layer's `agent_id`/`run_id` are
+        ordinary grouping there, and `build_fact_layer.py` rewrites them.
+        """
+        if not self.is_pinned or not metadata:
+            return
+        stored_metadata = stored_metadata or {}
+        changed = sorted(
+            key for key in DERIVED_METADATA_KEYS if key in metadata and metadata[key] != stored_metadata.get(key)
+        )
+        if changed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "metadata may echo "
+                    + ", ".join(DERIVED_METADATA_KEYS)
+                    + " back unchanged but may not alter them. These do not match the stored memory: "
+                    + ", ".join(changed)
+                    + "."
+                ),
+            )
+        if stored_user_id not in SHARED_SCOPES:
+            return
+        regrouped = sorted(key for key in GROUPING_METADATA_KEYS if key in metadata)
+        if regrouped:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "metadata may not set "
+                    + ", ".join(regrouped)
+                    + " on a shared memory. Grouping ids there are server-controlled, because they "
+                    "decide whose memory the row is presented as belonging to."
+                ),
+            )
+
+    def reject_scope_escaping_filters(self, filters: dict[str, Any] | None) -> None:
+        """Refuse a pinned caller's `/search` filters that could outrun the `user_id` pin.
+
+        THE HOLE THIS CLOSES, reproduced by executing mem0's own code rather than by
+        reading it:
+
+            caller filters: {"user_id": "anything", "AND": [{"user_id": "<victim>"}]}
+            server pins:    {**caller_filters, "user_id": "<caller>"}
+            -> effective user_id == "<victim>", i.e. a full read of another person's
+               private memories through a route that looks pinned.
+
+        Three library behaviours line up to do it. `{**d, k: v}` keeps the ORIGINAL
+        position of a key already present in `d`, so a caller who writes `user_id`
+        before `AND` in their JSON controls the iteration order of the merged dict.
+        `Memory._process_metadata_filters` then FLATTENS `AND` to the top level
+        through `merge_filters`, whose scalar branch is a plain `target[key] = value`
+        — an overwrite, not a conjunction. Finally `search()` does
+        `effective_filters.update(processed_filters)`, copying the attacker's
+        `user_id` back over the pin. Measured both ways: with `user_id` first it
+        escapes, without it, it does not — so no fix that depends on key order is a
+        fix.
+
+        Which is why this is an ALLOWLIST over VALUES and not a list of the operator
+        keys that happen to be dangerous today. `OR`/`NOT` nest into `$or`/`$not`,
+        which pgvector joins with AND, so those two do not escape — currently.
+        `requirements.txt` pins `mem0ai>=0.1.48`, a FLOOR: the filter compiler is not
+        a fixed target, and a denylist over it stops covering the moment a release
+        adds a fourth logical key, silently, with nothing able to notice. One rule —
+        every value must be a plain scalar — rejects every dict, every list and every
+        logical operator, present and future. It is the same argument `shared_write`
+        makes for testing scope membership against an enumerated set rather than a
+        prefix.
+
+        It costs the real callers nothing: every filter this deployment sends is a
+        single scalar — `{"agent_id": "facts"}` from the console and from
+        `.claude/hooks/mem0/`, `{"run_id": <parent id>}` from the console's fact
+        panel. It DOES newly 400 an operator-shaped `mem0ctl.py search --filters`
+        payload, which accepts arbitrary JSON through a pinned credential; that is
+        the intended behaviour change and not an oversight.
+
+        `user_id` is exempt because the route overwrites it with the pin one line
+        later, and that overwrite is `pin`'s documented, tested behaviour. There is
+        no gap between what is checked here and what is sent: the key this skips is
+        the one key the server itself supplies.
+
+        `None` is refused along with the containers rather than waved through as a
+        harmless scalar. `{"k": null}` compiles to `payload->>'k' = 'None'` — a
+        filter matching no row, returning 200 with an empty list, which is the
+        silent-wrong-answer shape the rest of this module exists to keep out.
+
+        `/search` is the whole surface. `GET /memories` accepts no `filters` at all:
+        it builds its own dict from three scalar query params through
+        `listing.listing_filters`, and FastAPI binds an `Optional[str]` query param
+        to the last value, never to a list. Unpinned callers are not held to any of
+        it — they can already name any `user_id` outright, so there is no pin to
+        escape.
+        """
+        if not self.is_pinned or not filters:
+            return
+        offending = sorted(
+            key for key, value in filters.items() if key != "user_id" and not isinstance(value, FILTER_SCALAR_TYPES)
+        )
+        if offending:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "filters may only carry plain string, number or boolean values for an SSO caller. "
+                    "Nested filter operators are not available on this path. Offending keys: "
+                    + ", ".join(offending)
+                    + "."
+                ),
+            )
 
 
 async def resolve_scope(
