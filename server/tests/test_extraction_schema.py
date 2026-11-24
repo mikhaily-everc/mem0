@@ -28,6 +28,7 @@ import unittest
 
 import mem0.memory.main as mem0_main
 from mem0.configs.prompts import ADDITIVE_EXTRACTION_PROMPT
+from pydantic import ValidationError
 
 from llms.schema import MEMORY_SCHEMA, ExtractedMemory, MemoryExtraction
 
@@ -326,6 +327,36 @@ class RoundTripTest(unittest.TestCase):
         """ "Nothing worth extracting" must be expressible, or the grammar forces invention."""
         raw = MemoryExtraction(memory=[]).model_dump_json()
         self.assertEqual(self._mem0_parse(raw), [])
+
+
+class MissingLinkedMemoryIdsTest(unittest.TestCase):
+    """GPT-6 Luna drops `linked_memory_ids` despite a strict schema; the parser must default it."""
+
+    LUNA = '{"memory":[{"id":"0","text":"Run `zorblat reindex --shard 7`.","attributed_to":"user"}]}'
+    GPT55 = (
+        '{"memory":[{"id":"0","text":"Run `zorblat reindex --shard 7`.",'
+        '"attributed_to":"user","linked_memory_ids":["3"]}]}'
+    )
+
+    def test_a_luna_shaped_response_without_the_field_parses(self) -> None:
+        parsed = MemoryExtraction.model_validate_json(self.LUNA)
+        self.assertEqual(parsed.memory[0].linked_memory_ids, [])
+        self.assertEqual(parsed.memory[0].text, "Run `zorblat reindex --shard 7`.")
+
+    def test_the_full_gpt55_shape_still_parses_unchanged(self) -> None:
+        parsed = MemoryExtraction.model_validate_json(self.GPT55)
+        self.assertEqual(parsed.memory[0].linked_memory_ids, ["3"])
+
+    def test_the_wire_schema_still_requires_the_field(self) -> None:
+        item = MEMORY_SCHEMA["properties"]["memory"]["items"]
+        self.assertIn("linked_memory_ids", item["required"])
+
+    def test_nothing_else_was_loosened(self) -> None:
+        for field in ("id", "text", "attributed_to"):
+            raw = json.loads(self.GPT55)
+            del raw["memory"][0][field]
+            with self.assertRaises(ValidationError, msg=field):
+                MemoryExtraction.model_validate_json(json.dumps(raw))
 
 
 if __name__ == "__main__":
