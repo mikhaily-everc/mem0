@@ -90,32 +90,39 @@ class SchemaEnforcingOpenAILLM(OpenAILLM):
         if upgrade:
             response_format = OPENAI_STRICT_RESPONSE_FORMAT
 
-        result = super().generate_response(
-            messages,
-            response_format=response_format,
-            tools=tools,
-            tool_choice=tool_choice,
-            **kwargs,
-        )
-
-        if not upgrade:
-            return result
-
         # Validate rather than trust. With a grammar in force this should be unreachable,
         # which is exactly why a failure must be loud: the likely causes are the constraint
         # silently not applying (a backend that ignored `strict`) or the response being cut off
         # at max_tokens. Either way, returning it would hand mem0 something it turns into a
         # silent "no new memories found". mem0's caller re-raises LLM errors as LLMError, so
         # this reaches an operator instead.
-        try:
-            parsed = MemoryExtraction.model_validate_json(result)
-        except (ValidationError, TypeError) as exc:
-            preview = (result or "")[:200] if isinstance(result, str) else repr(result)[:200]
-            raise ValueError(
-                "LLM returned output that does not match the extraction schema despite a strict "
-                "json_schema request. Likely either the backend ignored `strict` or the "
-                f"response was truncated at max_tokens. First 200 chars: {preview!r}"
-            ) from exc
+        #
+        # One retry first: a sampled response can miss the schema once and not twice. A backstop
+        # only; the schema itself must not demand what a model is told to omit (see schema.py).
+        attempts = 2 if upgrade else 1
+        for attempt in range(attempts):
+            result = super().generate_response(
+                messages,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                **kwargs,
+            )
+            if not upgrade:
+                return result
+            try:
+                parsed = MemoryExtraction.model_validate_json(result)
+                break
+            except (ValidationError, TypeError) as exc:
+                preview = (result or "")[:200] if isinstance(result, str) else repr(result)[:200]
+                if attempt + 1 < attempts:
+                    logger.warning("extraction missed the schema, retrying once: %s", preview)
+                    continue
+                raise ValueError(
+                    "LLM returned output that does not match the extraction schema despite a "
+                    "strict json_schema request. Likely either the backend ignored `strict` or "
+                    f"the response was truncated at max_tokens. First 200 chars: {preview!r}"
+                ) from exc
 
         # The one place the model's own output is visible before mem0 filters it — see
         # log_extraction. This is what makes a silent under-produce attributable.

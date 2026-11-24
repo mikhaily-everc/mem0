@@ -30,7 +30,7 @@ import mem0.memory.main as mem0_main
 from mem0.configs.prompts import ADDITIVE_EXTRACTION_PROMPT
 from pydantic import ValidationError
 
-from llms.schema import MEMORY_SCHEMA, ExtractedMemory, MemoryExtraction
+from llms.schema import _WIRE_OMITTED, MEMORY_SCHEMA, ExtractedMemory, MemoryExtraction
 
 _SOURCE = inspect.getsource(mem0_main)
 
@@ -146,11 +146,11 @@ class ElementFieldsTest(unittest.TestCase):
 
     def test_the_fields_mem0_ignores_are_exactly_the_ones_the_prompt_demands(self) -> None:
         """The other direction. Extra fields are not free, so each one needs a reason; the reason
-        here is that ADDITIVE_EXTRACTION_PROMPT mandates them, and a grammar that forbids what the
+        here is that ADDITIVE_EXTRACTION_PROMPT requires them, and a grammar that forbids what the
         prompt demands clips the model against its own instructions. If mem0's prompt stops asking
         for one, drop it from the schema rather than widening this assertion."""
         ignored = set(_item_schema()["properties"]) - _element_fields()
-        self.assertEqual(ignored, {"id", "linked_memory_ids"})
+        self.assertEqual(ignored, {"id"})
         for field in ignored:
             with self.subTest(field=field):
                 self.assertIn(field, _prompt_fields())
@@ -165,9 +165,18 @@ class PromptAgreementTest(unittest.TestCase):
 
     def test_the_schema_and_the_prompt_ask_for_the_same_fields(self) -> None:
         """Under `additionalProperties: false` the grammar is the harder constraint, so any field
-        the prompt documents and the schema omits is unrepresentable — the model is told to emit
-        it and forbidden from doing so, on every object."""
-        self.assertEqual(set(_prompt_fields()), set(_item_schema()["properties"]))
+        the prompt REQUIRES and the schema omits is unrepresentable. Fields the prompt calls
+        optional are the exception: strict mode cannot make them optional, so they stay off the
+        wire (`_WIRE_OMITTED`) and the model is free to follow the prompt and omit them."""
+        self.assertEqual(
+            set(_prompt_fields()) - _WIRE_OMITTED, set(_item_schema()["properties"])
+        )
+
+    def test_every_field_off_the_wire_is_one_the_prompt_calls_optional(self) -> None:
+        section = ADDITIVE_EXTRACTION_PROMPT[ADDITIVE_EXTRACTION_PROMPT.index("## Fields") :]
+        for field in _WIRE_OMITTED:
+            with self.subTest(field=field):
+                self.assertRegex(section, rf"\*\*{field}\*\* \([^)]*optional")
 
     def test_the_prompt_asks_for_the_same_envelope_key(self) -> None:
         self.assertIn('"memory"', ADDITIVE_EXTRACTION_PROMPT)
@@ -330,7 +339,7 @@ class RoundTripTest(unittest.TestCase):
 
 
 class MissingLinkedMemoryIdsTest(unittest.TestCase):
-    """GPT-6 Luna drops `linked_memory_ids` despite a strict schema; the parser must default it."""
+    """GPT-6 Luna omits `linked_memory_ids`, as the prompt allows; the schema must not require it."""
 
     LUNA = '{"memory":[{"id":"0","text":"Run `zorblat reindex --shard 7`.","attributed_to":"user"}]}'
     GPT55 = (
@@ -347,9 +356,15 @@ class MissingLinkedMemoryIdsTest(unittest.TestCase):
         parsed = MemoryExtraction.model_validate_json(self.GPT55)
         self.assertEqual(parsed.memory[0].linked_memory_ids, ["3"])
 
-    def test_the_wire_schema_still_requires_the_field(self) -> None:
+    def test_the_wire_schema_does_not_declare_the_field(self) -> None:
         item = MEMORY_SCHEMA["properties"]["memory"]["items"]
-        self.assertIn("linked_memory_ids", item["required"])
+        self.assertNotIn("linked_memory_ids", item["properties"])
+        self.assertNotIn("linked_memory_ids", item["required"])
+
+    def test_every_wire_property_is_required_as_strict_mode_demands(self) -> None:
+        item = MEMORY_SCHEMA["properties"]["memory"]["items"]
+        self.assertEqual(set(item["properties"]), set(item["required"]))
+        self.assertIs(item["additionalProperties"], False)
 
     def test_nothing_else_was_loosened(self) -> None:
         for field in ("id", "text", "attributed_to"):

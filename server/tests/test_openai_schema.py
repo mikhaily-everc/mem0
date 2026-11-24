@@ -199,6 +199,35 @@ class ValidationTest(unittest.TestCase):
                 response_format=WEAK,
             )
 
+    def test_a_luna_shaped_response_without_linked_memory_ids_passes(self) -> None:
+        """Luna omits the field the prompt calls optional; that must neither raise nor retry."""
+        luna = '{"memory": [{"id": "0", "text": "one", "attributed_to": "user"}]}'
+        with mock.patch.object(OpenAILLM, "generate_response", return_value=luna) as parent:
+            result = _llm().generate_response(MESSAGES, response_format=WEAK)
+        self.assertEqual(parent.call_count, 1)
+        self.assertEqual(result.parsed.memory[0].text, "one")
+
+    def test_one_bad_response_is_retried_once_then_returned(self) -> None:
+        with mock.patch.object(
+            OpenAILLM, "generate_response", side_effect=['{"memory": [{"id": "0"', GOOD]
+        ) as parent:
+            result = _llm().generate_response(MESSAGES, response_format=WEAK)
+        self.assertEqual(parent.call_count, 2)
+        self.assertEqual(result.parsed.memory[0].text, "The gateway runs on port 8800")
+
+    def test_two_bad_responses_still_raise_after_one_retry(self) -> None:
+        with mock.patch.object(
+            OpenAILLM, "generate_response", return_value=OLD_FACTS_SHAPE
+        ) as parent:
+            with self.assertRaises(ValueError):
+                _llm().generate_response(MESSAGES, response_format=WEAK)
+        self.assertEqual(parent.call_count, 2)
+
+    def test_an_unupgraded_call_is_never_retried(self) -> None:
+        with mock.patch.object(OpenAILLM, "generate_response", return_value="x") as parent:
+            _llm().generate_response(MESSAGES)
+        self.assertEqual(parent.call_count, 1)
+
     def test_truncated_output_raises_and_says_why(self) -> None:
         """max_tokens mid-document is the realistic cause; the message must name it so the
         operator does not go hunting for a schema bug."""
