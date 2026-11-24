@@ -21,25 +21,25 @@ So a grammar that forces `facts` makes mem0's `.get("memory", [])` return `[]`, 
 found". Nothing raises, nothing logs. `tests/test_extraction_schema.py` pins the key against
 the installed library rather than against this docstring, because a docstring cannot go red.
 
-## Why four fields, when mem0 reads two
+## Three wire fields, though the prompt documents four and mem0 reads two
 
 The system prompt on that path is mem0's own `ADDITIVE_EXTRACTION_PROMPT`
-(`mem0/configs/prompts.py`), and its OUTPUT FORMAT section mandates four:
+(`mem0/configs/prompts.py`), and its OUTPUT FORMAT section documents four:
 
     id                 (string, required)  sequential, "0", "1", ...
     text               (string, required)
     attributed_to      (string, required)  "user" | "assistant"
     linked_memory_ids  (array,  optional)  "Omit or pass [] if no existing memories"
 
-mem0 ignores `id` and `linked_memory_ids` entirely. They are in the schema anyway so that the
-grammar and the prompt AGREE: under `additionalProperties: false` a two-field schema would make
-two of the four keys the prompt demands unrepresentable, clipping the model's token
-distribution against its own instructions on every object. The wasted bytes are a rounding
-error next to that; prompt/grammar disagreement is a quality risk that is invisible in tests.
+mem0 ignores `id` and `linked_memory_ids` entirely. `id` stays on the wire so the grammar and
+the prompt AGREE on every field the prompt REQUIRES: under `additionalProperties: false`,
+leaving one out makes a key the prompt demands unrepresentable.
 
-Both are non-nullable and required, which is also what lets `linked_memory_ids` stay honest:
-strict mode cannot express "optional" by omission (see below), and the prompt itself offers
-`[]` as the empty case, so `[]` is the encoding — no nullable union needed for it.
+`linked_memory_ids` is the one the prompt calls OPTIONAL, and it is NOT on the wire. Strict mode
+cannot express "optional" by omission (see below), so declaring it forced a field the prompt
+says to omit. GPT-6 Luna follows the prompt: it dropped the field on ~90% of calls (2/20 valid
+vs 20/20 for gpt-5.5) and each omission failed validation, so `POST /memories` answered 502.
+`ExtractedMemory` still accepts it, defaulted to `[]`, so a model that emits it anyway parses.
 
 ## Two rules both backends enforce, and one they do not share
 
@@ -59,7 +59,7 @@ back out — see there.
 import logging
 from typing import Any, Dict, FrozenSet
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ExtractedMemory(BaseModel):
@@ -76,17 +76,8 @@ class ExtractedMemory(BaseModel):
     # a speaker's name unrepresentable — the model would be instructed to emit it and forbidden
     # from doing so, and the fallback is mis-attributing that memory to "assistant".
     attributed_to: str
-    linked_memory_ids: list[str]
-
-    # Parse-side default only: the wire schema above keeps the field required (strict grammar
-    # needs it), but GPT-6 Luna omits it on ~90% of calls. mem0 never reads it, so a missing
-    # value is `[]`, not a failed extraction. `id`/`text`/`attributed_to` stay strictly required.
-    @model_validator(mode="before")
-    @classmethod
-    def _default_linked_memory_ids(cls, data: Any) -> Any:
-        if isinstance(data, dict) and "linked_memory_ids" not in data:
-            return {**data, "linked_memory_ids": []}
-        return data
+    # Parse-side only: `_wire_schema` strips it from the grammar (see `_WIRE_OMITTED`).
+    linked_memory_ids: list[str] = Field(default_factory=list)
 
 
 class MemoryExtraction(BaseModel):
@@ -231,10 +222,29 @@ def _inline_refs(node: Any, defs: Dict[str, Any], seen: FrozenSet[str] = frozens
     return node
 
 
+# Fields the model parses but the grammar must not declare: strict mode needs every property in
+# `required`, and the prompt tells the model to omit these.
+_WIRE_OMITTED: FrozenSet[str] = frozenset({"linked_memory_ids"})
+
+
+def _drop_omitted(node: Any) -> Any:
+    """Remove `_WIRE_OMITTED` from every object's `properties` and `required`, recursively."""
+    if isinstance(node, dict):
+        out = {k: _drop_omitted(v) for k, v in node.items()}
+        if isinstance(out.get("properties"), dict):
+            out["properties"] = {k: v for k, v in out["properties"].items() if k not in _WIRE_OMITTED}
+        if isinstance(out.get("required"), list):
+            out["required"] = [k for k in out["required"] if k not in _WIRE_OMITTED]
+        return out
+    if isinstance(node, list):
+        return [_drop_omitted(v) for v in node]
+    return node
+
+
 def _wire_schema(model: type[BaseModel]) -> Dict[str, Any]:
     """`model_json_schema()` reduced to what a grammar compiler will accept from every backend."""
     raw = model.model_json_schema()
-    return _strip_prose(_inline_refs(raw, raw.get("$defs", {})))
+    return _drop_omitted(_strip_prose(_inline_refs(raw, raw.get("$defs", {}))))
 
 
 # Resolved once at import. The grammar is compiled and cached per-schema on the provider side,
