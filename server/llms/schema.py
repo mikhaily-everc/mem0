@@ -59,7 +59,7 @@ back out — see there.
 import logging
 from typing import Any, Dict, FrozenSet
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ExtractedMemory(BaseModel):
@@ -77,6 +77,16 @@ class ExtractedMemory(BaseModel):
     # from doing so, and the fallback is mis-attributing that memory to "assistant".
     attributed_to: str
     linked_memory_ids: list[str]
+
+    # Parse-side default only: the wire schema above keeps the field required (strict grammar
+    # needs it), but GPT-6 Luna omits it on ~90% of calls. mem0 never reads it, so a missing
+    # value is `[]`, not a failed extraction. `id`/`text`/`attributed_to` stay strictly required.
+    @model_validator(mode="before")
+    @classmethod
+    def _default_linked_memory_ids(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "linked_memory_ids" not in data:
+            return {**data, "linked_memory_ids": []}
+        return data
 
 
 class MemoryExtraction(BaseModel):
